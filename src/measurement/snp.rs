@@ -8,7 +8,7 @@ use crate::{
         gctx::{Gctx, Updating, VMSA_GPA},
         large_array::LargeArray,
         ovmf::{OvmfSevMetadataSectionDesc, SectionType, OVMF},
-        sev_hashes::SevHashes,
+        sev_hashes::{SevHashes, Sha256Hash},
         vcpu_types::CpuType,
         vmsa::{GuestFeatures, VMMType, VMSA},
     },
@@ -221,6 +221,78 @@ pub fn snp_calc_launch_digest(
     };
 
     snp_update_metadata_pages(&mut gctx, &ovmf, sev_hashes.as_ref(), official_vmm_type)?;
+
+    let vmsa = VMSA::new(
+        ovmf.sev_es_reset_eip()?.into(),
+        snp_measurement.vcpu_type,
+        official_vmm_type,
+        Some(snp_measurement.vcpus as u64),
+        snp_measurement.guest_features,
+    );
+
+    for vmsa_page in vmsa.pages(snp_measurement.vcpus as usize)?.iter() {
+        gctx.update_page(PageType::Vmsa, VMSA_GPA, Some(vmsa_page.as_slice()), None)?
+    }
+
+    let gctx = gctx.finished();
+
+    Ok(gctx.ld())
+}
+
+/// Arguments required to calculate the SNP measurement
+pub struct SnpMeasurementWithHashesArgs<'a> {
+    /// Number of vcpus
+    pub vcpus: u32,
+    /// vcpu type
+    pub vcpu_type: CpuType,
+    /// Path to OVMF file
+    pub ovmf_file: PathBuf,
+    /// Active kernel guest features
+    pub guest_features: GuestFeatures,
+    /// Kernel hash
+    pub kernel_hash: Sha256Hash,
+    /// Initrd hash
+    pub initrd_hash: Sha256Hash,
+    /// Append arguments hash for kernel
+    pub append_hash: Sha256Hash,
+    /// Already calculated OVMF hash
+    pub ovmf_hash_str: Option<&'a str>,
+    /// vmm type
+    pub vmm_type: Option<VMMType>,
+}
+
+/// Calulate an SEV-SNP launch digest
+pub fn snp_calc_launch_digest_with_hashes(
+    snp_measurement: SnpMeasurementWithHashesArgs,
+) -> Result<SnpLaunchDigest, MeasurementError> {
+    let ovmf = OVMF::new(snp_measurement.ovmf_file)?;
+
+    let mut gctx: Gctx<Updating> = match snp_measurement.ovmf_hash_str {
+        Some(hash) => {
+            let ovmf_hash = Vec::from_hex(hash)?;
+            Gctx::new(ovmf_hash.as_slice())?
+        }
+        None => {
+            let mut gctx = Gctx::default();
+
+            gctx.update_page(PageType::Normal, ovmf.gpa(), Some(ovmf.data()), None)?;
+
+            gctx
+        }
+    };
+
+    let sev_hashes = SevHashes::new_raw(
+        snp_measurement.kernel_hash, 
+        snp_measurement.initrd_hash,
+        snp_measurement.append_hash
+    );
+
+    let official_vmm_type = match snp_measurement.vmm_type {
+        Some(vmm) => vmm,
+        None => VMMType::QEMU,
+    };
+
+    snp_update_metadata_pages(&mut gctx, &ovmf, Some(&sev_hashes), official_vmm_type)?;
 
     let vmsa = VMSA::new(
         ovmf.sev_es_reset_eip()?.into(),

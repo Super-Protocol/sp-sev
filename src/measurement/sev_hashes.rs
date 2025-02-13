@@ -16,7 +16,8 @@ use uuid::{uuid, Uuid};
 
 use crate::error::*;
 
-type Sha256Hash = [u8; 32];
+/// Alias for a 256-bit hash represented as a fixed-size array of 32 bytes.
+pub type Sha256Hash = [u8; 32];
 
 /// GUID stored as little endian
 #[derive(Debug, Clone, Copy, Serialize, Default)]
@@ -178,6 +179,15 @@ impl SevHashes {
             initrd_hash,
             cmdline_hash,
         })
+    }
+
+    /// Generate hashes from the user provided kernel, initrd, and cmdline hashes.
+    pub fn new_raw(kernel_hash: Sha256Hash, initrd_hash: Sha256Hash, cmdline_hash: Sha256Hash) -> Self {
+        Self {
+            kernel_hash,
+            initrd_hash,
+            cmdline_hash,
+        }
     }
 
     /// Generate the SEV hashes area - this must be *identical* to the way QEMU
