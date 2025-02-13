@@ -21,7 +21,8 @@ use crate::util::parser_helper::{ReadExt, WriteExt};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-type Sha256Hash = [u8; 32];
+/// Alias for a 256-bit hash represented as a fixed-size array of 32 bytes.
+pub type Sha256Hash = [u8; 32];
 
 /// GUID stored as little endian
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -283,6 +284,15 @@ impl SevHashes {
             initrd_hash,
             cmdline_hash,
         })
+    }
+
+    /// Generate hashes from the user provided kernel, initrd, and cmdline hashes.
+    pub fn new_raw(kernel_hash: Sha256Hash, initrd_hash: Sha256Hash, cmdline_hash: Sha256Hash) -> Self {
+        Self {
+            kernel_hash,
+            initrd_hash,
+            cmdline_hash,
+        }
     }
 
     /// Generate the SEV hashes area - this must be *identical* to the way QEMU
