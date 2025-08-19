@@ -43,6 +43,7 @@ fn map_fw_err(raw_error: RawFwError) -> UserApiError {
 
 /// A handle to the SEV-SNP guest device.
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
 pub struct Firmware(File);
 
 #[cfg(target_os = "linux")]
@@ -75,7 +76,7 @@ impl Firmware {
     /// ];
     ///
     /// // Create a message version (OPTIONAL)
-    /// let msg_ver: u8 = 1;
+    /// let msg_ver: u32 = 1;
     ///
     /// // Open a connection to the AMD Secure Processor.
     /// let mut fw: Firmware = Firmware::open().unwrap();
@@ -83,15 +84,15 @@ impl Firmware {
     /// // Set the VMPL level (OPTIONAL).
     /// let vmpl = 1;
     ///
-    /// // Request the attestation report with our unique_data.
-    /// let attestation_report: AttestationReport = fw.get_report(Some(msg_ver), Some(unique_data), Some(vmpl)).unwrap();
+    /// // Request the raw attestation report with our unique_data.
+    /// let report_bytes: Vec<u8> = fw.get_report(Some(msg_ver), Some(unique_data), Some(vmpl)).unwrap();
     /// ```
     pub fn get_report(
         &mut self,
         message_version: Option<u32>,
         data: Option<[u8; 64]>,
         vmpl: Option<u32>,
-    ) -> Result<AttestationReport, UserApiError> {
+    ) -> Result<Vec<u8>, UserApiError> {
         let mut input = ReportReq::new(data, vmpl)?;
         let mut response = ReportRsp::default();
 
@@ -107,7 +108,7 @@ impl Firmware {
             Err(FirmwareError::from(response.status))?
         }
 
-        Ok(response.report)
+        Ok(response.report.to_vec())
     }
 
     /// Request an extended attestation report from the AMD Secure Processor.
@@ -119,7 +120,7 @@ impl Firmware {
         message_version: Option<u32>,
         data: Option<[u8; 64]>,
         vmpl: Option<u32>,
-    ) -> Result<(AttestationReport, Option<Vec<CertTableEntry>>), UserApiError> {
+    ) -> Result<(Vec<u8>, Option<Vec<CertTableEntry>>), UserApiError> {
         let report_request = ReportReq::new(data, vmpl)?;
 
         let mut report_response = ReportRsp::default();
@@ -180,7 +181,7 @@ impl Firmware {
         }
 
         if ext_report_request.certs_len == 0 {
-            return Ok((report_response.report, None));
+            return Ok((report_response.report.to_vec(), None));
         }
 
         let mut certificates: Vec<CertTableEntry>;
@@ -194,23 +195,45 @@ impl Firmware {
         }
 
         // Return both the Attestation Report, as well as the Cert Table.
-        Ok((report_response.report, Some(certificates)))
+        Ok((report_response.report.to_vec(), Some(certificates)))
     }
 
-    /// Fetches a derived key from the AMD Secure Processor. The `message_version` will default to `1` if `None` is specified.
+    /// Fetches a derived key from the AMD Secure Processor. The `message_version` will default to `2` if `None` is specified.
     ///
     /// # Example:
     /// ```ignore
-    /// let request: DerivedKey = DerivedKey::new(false, GuestFieldSelect(1), 0, 0, 0);
+    /// let request: DerivedKey = DerivedKey::new(false, GuestFieldSelect(1), 0, 0, 0, None);
     ///
     /// let mut fw: Firmware = Firmware::open().unwrap();
-    /// let derived_key: DerivedKeyRsp = fw.get_derived_key(None, request).unwrap();
+    /// let derived_key: DerivedKeyRsp = fw.get_derived_key(1, request).unwrap();
     /// ```
     pub fn get_derived_key(
         &mut self,
         message_version: Option<u32>,
-        derived_key_request: DerivedKey,
+        mut derived_key_request: DerivedKey,
     ) -> Result<[u8; 32], UserApiError> {
+        // Defaulting to 2 instead of the regular 1 introduced in FW 1.58
+        let message_version = if message_version.is_some() {
+            message_version
+        } else {
+            Some(2)
+        };
+
+        // Check if the launch mitigation vector is provided for message version >= 2
+        if let Some(version) = message_version {
+            if version >= 2 && derived_key_request.launch_mit_vector.is_none() {
+                use std::io;
+
+                return Err(UserApiError::IOError(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Launch Mitigation Vector must be provided for message version >= 2",
+                )));
+            } else {
+                // Set launch_vector to None for message requests version 1.
+                derived_key_request.launch_mit_vector = None;
+            }
+        }
+
         let mut ffi_derived_key_request: DerivedKeyReq = derived_key_request.into();
         let mut ffi_derived_key_response: DerivedKeyRsp = Default::default();
 
@@ -232,5 +255,28 @@ impl Firmware {
         }
 
         Ok(ffi_derived_key_response.key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_firmware_error_mapping() {
+        let raw_error = RawFwError(1); // Lower byte error
+        let error = map_fw_err(raw_error);
+        assert!(matches!(error, UserApiError::FirmwareError(_)));
+
+        let raw_error = RawFwError(0x100000000u64); // Upper byte error
+        let error = map_fw_err(raw_error);
+        assert!(matches!(error, UserApiError::VmmError(_)));
+
+        let raw_error = RawFwError(0x0u64); // lower byte error
+        let error = map_fw_err(raw_error);
+        assert!(matches!(
+            error,
+            UserApiError::FirmwareError(FirmwareError::UnknownSevError(0))
+        ));
     }
 }

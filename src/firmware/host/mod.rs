@@ -4,6 +4,9 @@
 mod types;
 pub use types::*;
 
+#[cfg(feature = "snp")]
+use crate::Generation;
+
 #[cfg(target_os = "linux")]
 use super::linux::host::{ioctl::*, types::GetId};
 
@@ -18,10 +21,7 @@ use crate::error::*;
 
 #[cfg(feature = "sev")]
 #[cfg(target_os = "linux")]
-use crate::{
-    certs::sev::sev::{Certificate, Chain},
-    Build as CertBuild, Version as CertVersion,
-};
+use crate::certs::sev::sev::{Certificate, Chain};
 
 #[cfg(target_os = "linux")]
 use std::{
@@ -40,6 +40,9 @@ use std::convert::TryInto;
 #[cfg(feature = "snp")]
 #[cfg(target_os = "linux")]
 use super::linux::host::types::SnpCommit;
+
+#[cfg(all(target_os = "linux", feature = "snp"))]
+use super::linux::host::types::{SnpPlatformStatus as FFISnpPlatformStatus, SnpSetConfig};
 
 /// The CPU-unique identifier for the platform.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,8 +97,8 @@ impl Firmware {
             .map_err(|_| cmd_buf.encapsulate())?;
 
         Ok(Status {
-            build: CertBuild {
-                version: CertVersion {
+            build: crate::firmware::host::types::Build {
+                version: crate::firmware::host::types::Version {
                     major: info.version.major,
                     minor: info.version.minor,
                 },
@@ -212,14 +215,19 @@ impl Firmware {
     /// ```
     #[cfg(feature = "snp")]
     pub fn snp_platform_status(&mut self) -> Result<SnpPlatformStatus, UserApiError> {
-        let mut platform_status: SnpPlatformStatus = SnpPlatformStatus::default();
+        // Create an empty buffer for the SNP Platform Status to be written to by the Kernel.
+        let mut platform_status: FFISnpPlatformStatus = FFISnpPlatformStatus::default();
+
         let mut cmd_buf = Command::from_mut(&mut platform_status);
 
         SNP_PLATFORM_STATUS
             .ioctl(&mut self.0, &mut cmd_buf)
             .map_err(|_| cmd_buf.encapsulate())?;
 
-        Ok(platform_status)
+        // Determine SEV-SNP CPU generation in order to parse platform status accordingly.
+        let generation = Generation::identify_host_generation()?;
+
+        Ok((generation, &*platform_status).try_into()?)
     }
 
     /// The firmware will perform the following actions:  
@@ -260,7 +268,8 @@ impl Firmware {
     /// ```
     #[cfg(feature = "snp")]
     pub fn snp_set_config(&mut self, new_config: Config) -> Result<(), UserApiError> {
-        let mut binding = new_config.try_into()?;
+        let mut binding: SnpSetConfig = new_config.try_into()?;
+
         let mut cmd_buf = Command::from_mut(&mut binding);
 
         SNP_SET_CONFIG
@@ -280,12 +289,26 @@ impl Firmware {
     ///
     /// let mut firmware: Firmware = Firmware::open().unwrap();
     ///
-    /// firmware.snp_vlek_load(hashstick_bytes.as_slice()).unwrap();
+    /// // Parse the bytes into a `WrappedVlekHashstick` to verify content before passing to the firmware.:
+    /// let generation = Generation::identify_host_generation()?;
+    /// let hashstick = WrappedVlekHashstick::from_bytes(hashstick_bytes.as_slice(), generation)?;
+    ///
+    /// // Load the VLEK Hashstick into the AMD Secure Processor.
+    /// firmware.snp_vlek_load(hashstick).unwrap();
     /// ```
-    pub fn snp_vlek_load(&mut self, hashstick_bytes: &[u8]) -> Result<(), UserApiError> {
-        use types::FFI::types::{SnpVlekLoad, WrappedVlekHashstick};
+    pub fn snp_vlek_load(&mut self, hashstick: WrappedVlekHashstick) -> Result<(), UserApiError> {
+        use std::convert::TryFrom;
 
-        let parsed_bytes: WrappedVlekHashstick = hashstick_bytes.try_into()?;
+        use types::FFI::types::{SnpVlekLoad, WrappedVlekHashstick as FFIWrappedVlekHashstick};
+
+        let generation = Generation::identify_host_generation()?;
+
+        let mut buffer: [u8; 432] = [0; 432];
+
+        hashstick.write_bytes(&mut buffer[..], generation)?;
+
+        let parsed_bytes: FFIWrappedVlekHashstick =
+            FFIWrappedVlekHashstick::try_from(buffer.as_slice())?;
 
         let mut vlek_load: SnpVlekLoad = SnpVlekLoad::new(&parsed_bytes);
         let mut cmd_buf = Command::from_mut(&mut vlek_load);

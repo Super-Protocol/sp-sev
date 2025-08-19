@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::ops::{Deref, DerefMut};
+
 #[cfg(target_os = "linux")]
 use crate::error::CertError;
 
@@ -227,8 +229,8 @@ pub struct SnpCommit {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(C, packed)]
 pub struct SnpSetConfig {
-    /// The TCB_VERSION to report in guest attestation reports.
-    pub reported_tcb: UAPI::TcbVersion,
+    /// The bytes corresponding to the TCB_VERSION to report in guest attestation reports.
+    pub reported_tcb: [u8; 8],
 
     /// mask_id [0] : whether chip id is present in attestation reports or not  
     /// mask_id [1]: whether attestation reports are signed or not
@@ -249,23 +251,23 @@ impl Default for SnpSetConfig {
     }
 }
 
-// Length defined in the Linux Kernel for the IOCTL.
+// Expected length for the VLEK hashstick.
 const HASHSTICK_BUFFER_LEN: usize = 432;
 
 #[cfg(feature = "snp")]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(C, packed)]
-/// Wrapped VLEK data.
-pub struct WrappedVlekHashstick<'a> {
-    /// Opaque data provided by AMD Key Distribution Server
-    /// (as described in SEV-SNP Firmware ABI 1.54, SNP_VLEK_LOAD)
-    pub data: &'a [u8], // 432 bytes of data
+/// Wrapped VLEK data for FFI layer.
+pub struct WrappedVlekHashstick {
+    /// Wrapped VLEK data provided by AMD Key Distribution Server as bytes.
+    /// Address to this data is passed to the kernel.
+    pub data: [u8; HASHSTICK_BUFFER_LEN],
 }
 
-impl<'a, 'b: 'a> std::convert::TryFrom<&'b [u8]> for WrappedVlekHashstick<'a> {
+impl std::convert::TryFrom<&[u8]> for WrappedVlekHashstick {
     type Error = HashstickError;
 
-    fn try_from(value: &'b [u8]) -> Result<Self, Self::Error> {
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         if value.len() != HASHSTICK_BUFFER_LEN {
             return Err(HashstickError::InvalidLength);
         }
@@ -274,7 +276,21 @@ impl<'a, 'b: 'a> std::convert::TryFrom<&'b [u8]> for WrappedVlekHashstick<'a> {
             return Err(HashstickError::EmptyHashstickBuffer);
         }
 
-        Ok(Self { data: value })
+        // Validate reserved fields are zero as required by spec
+        // Check first reserved field (0x0C-0x0F)
+        if value[0x0C..0x10] != [0u8; 4] {
+            return Err(HashstickError::InvalidReservedField);
+        }
+
+        // Check second reserved field (0x198-0x19F)
+        if value[0x198..0x1A0] != [0u8; 8] {
+            return Err(HashstickError::InvalidReservedField);
+        }
+
+        let mut data = [0u8; HASHSTICK_BUFFER_LEN];
+        data.copy_from_slice(value);
+
+        Ok(Self { data })
     }
 }
 
@@ -283,7 +299,7 @@ impl<'a, 'b: 'a> std::convert::TryFrom<&'b [u8]> for WrappedVlekHashstick<'a> {
 #[repr(C, packed)]
 /// Structure used to load a VLEK hashstick into the AMD Secure Processor.
 pub struct SnpVlekLoad {
-    /// Length of the command buffer read by the AMD Secure Processor.
+    /// Length of this command buffer in bytes.
     pub len: u32,
 
     /// Version of wrapped VLEK hashstick (Must be 0h).
@@ -291,7 +307,7 @@ pub struct SnpVlekLoad {
 
     _reserved: [u8; 3],
 
-    /// Address of wrapped VLEK hashstick ([WrappedVlekHashstick])
+    /// System Physical Address of wrapped VLEK hashstick ([WrappedVlekHashstick])
     pub vlek_wrapped_address: u64,
 }
 
@@ -303,14 +319,48 @@ impl SnpVlekLoad {
     }
 }
 
-impl<'a> std::convert::From<&WrappedVlekHashstick<'a>> for SnpVlekLoad {
-    fn from(value: &WrappedVlekHashstick<'a>) -> Self {
+impl From<&WrappedVlekHashstick> for SnpVlekLoad {
+    fn from(value: &WrappedVlekHashstick) -> Self {
         Self {
-            len: value.data.len() as u32,
+            len: std::mem::size_of::<SnpVlekLoad>() as u32,
             vlek_wrapped_version: 0u8,
             _reserved: Default::default(),
             vlek_wrapped_address: value as *const WrappedVlekHashstick as u64,
         }
+    }
+}
+
+#[cfg(feature = "snp")]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C, packed)]
+/// Kernel-friendly Snp Platform Status
+pub struct SnpPlatformStatus {
+    pub buffer: [u8; 32],
+}
+
+impl Deref for SnpPlatformStatus {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.buffer
+    }
+}
+
+impl DerefMut for SnpPlatformStatus {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buffer
+    }
+}
+
+impl AsRef<[u8]> for SnpPlatformStatus {
+    fn as_ref(&self) -> &[u8] {
+        &self.buffer
+    }
+}
+
+impl AsMut<[u8]> for SnpPlatformStatus {
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.buffer
     }
 }
 
@@ -393,13 +443,30 @@ mod test {
 
         use super::super::{WrappedVlekHashstick, HASHSTICK_BUFFER_LEN};
 
-        const VALID_HASHSTICK_BYTES: [u8; HASHSTICK_BUFFER_LEN] = [1u8; HASHSTICK_BUFFER_LEN];
+        const VALID_HASHSTICK_BYTES: [u8; HASHSTICK_BUFFER_LEN] = [
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        ];
+
         const INVALID_HASHSTICK_BYTES: [u8; 25] = [2u8; 25];
 
         #[test]
         fn test_bytes_to_wrapped_hashstick() {
             let bytes: [u8; HASHSTICK_BUFFER_LEN] = VALID_HASHSTICK_BYTES;
-            let expected: WrappedVlekHashstick = WrappedVlekHashstick { data: &bytes };
+            let expected: WrappedVlekHashstick = WrappedVlekHashstick { data: bytes };
             let actual: WrappedVlekHashstick =
                 WrappedVlekHashstick::try_from(VALID_HASHSTICK_BYTES.as_slice()).unwrap();
 
@@ -430,7 +497,7 @@ mod test {
             let actual: SnpVlekLoad = (&test_hashstick).into();
 
             let expected: SnpVlekLoad = SnpVlekLoad {
-                len: HASHSTICK_BUFFER_LEN as u32,
+                len: std::mem::size_of::<SnpVlekLoad>() as u32,
                 vlek_wrapped_version: 0u8,
                 _reserved: Default::default(),
                 vlek_wrapped_address: &test_hashstick as *const WrappedVlekHashstick as u64,
@@ -447,7 +514,7 @@ mod test {
             let actual: SnpVlekLoad = SnpVlekLoad::new(&test_hashstick);
 
             let expected: SnpVlekLoad = SnpVlekLoad {
-                len: HASHSTICK_BUFFER_LEN as u32,
+                len: std::mem::size_of::<SnpVlekLoad>() as u32,
                 vlek_wrapped_version: 0u8,
                 _reserved: Default::default(),
                 vlek_wrapped_address: &test_hashstick as *const WrappedVlekHashstick as u64,

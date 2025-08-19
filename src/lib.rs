@@ -112,7 +112,6 @@ pub mod error;
 
 #[cfg(all(feature = "sev", feature = "dangerous_hw_tests"))]
 pub use util::cached_chain;
-use util::{TypeLoad, TypeSave};
 
 #[cfg(all(feature = "openssl", feature = "sev"))]
 use certs::sev::sev;
@@ -136,64 +135,13 @@ use std::io::{Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-/// Information about the SEV platform version.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct Version {
-    /// The major version number.
-    pub major: u8,
+use bincode::config::{Configuration, Fixint, LittleEndian};
 
-    /// The minor version number.
-    pub minor: u8,
-}
-
-impl std::fmt::Display for Version {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}.{}", self.major, self.minor)
-    }
-}
-
-impl From<u16> for Version {
-    fn from(v: u16) -> Self {
-        Self {
-            major: ((v & 0xF0) >> 4) as u8,
-            minor: (v & 0x0F) as u8,
-        }
-    }
-}
-
-/// A description of the SEV platform's build information.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct Build {
-    /// The version information.
-    pub version: Version,
-
-    /// The build number.
-    pub build: u8,
-}
-
-impl std::fmt::Display for Build {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}.{}", self.version, self.build)
-    }
-}
-
-impl codicon::Decoder<()> for Build {
-    type Error = std::io::Error;
-
-    fn decode(mut reader: impl Read, _: ()) -> std::io::Result<Self> {
-        reader.load()
-    }
-}
-
-impl codicon::Encoder<()> for Build {
-    type Error = std::io::Error;
-
-    fn encode(&self, mut writer: impl Write, _: ()) -> std::io::Result<()> {
-        writer.save(self)
-    }
-}
+/// Bincode configuration for serializing and deserializing using little-endian and fixed
+/// integer encoding.
+pub const BINCODE_CFG: Configuration<LittleEndian, Fixint> = bincode::config::standard()
+    .with_little_endian()
+    .with_fixed_int_encoding();
 
 /// A representation for EPYC generational product lines.
 ///
@@ -256,6 +204,93 @@ pub enum Generation {
     /// Fifth generation EPYC (SEV, SEV-ES, SEV-SNP).
     #[cfg(any(feature = "sev", feature = "snp"))]
     Turin,
+}
+
+#[cfg(feature = "snp")]
+impl TryFrom<&[u8]> for Generation {
+    type Error = std::io::Error;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        if bytes.len() != 4 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid length of bytes representing cpuid",
+            ));
+        }
+
+        let base_model = (bytes[0] & 0xF0) >> 4;
+        let base_family = bytes[1] & 0x0F;
+
+        let ext_model = bytes[2] & 0x0F;
+
+        let ext_family = {
+            let low = (bytes[2] & 0xF0) >> 4;
+            let high = (bytes[3] & 0x0F) << 4;
+
+            low | high
+        };
+
+        let family = base_family + ext_family;
+        let model = (ext_model << 4) | base_model;
+
+        Self::identify_cpu(family, model)
+    }
+}
+
+/// Type alias for the CPU family
+#[cfg(feature = "snp")]
+pub type CpuFamily = u8;
+
+/// Type alias for the CPU model
+#[cfg(feature = "snp")]
+pub type CpuModel = u8;
+
+#[cfg(feature = "snp")]
+impl TryFrom<(CpuFamily, CpuModel)> for Generation {
+    type Error = std::io::Error;
+
+    fn try_from(val: (CpuFamily, CpuModel)) -> Result<Self, Self::Error> {
+        Self::identify_cpu(val.0, val.1)
+    }
+}
+
+#[cfg(feature = "snp")]
+impl Generation {
+    /// Identify the SEV generation based on the CPU family and model.
+    pub fn identify_cpu(family: u8, model: u8) -> Result<Self, std::io::Error> {
+        match family {
+            0x19 => match model {
+                0x0..=0xF => Ok(Self::Milan),
+                0x10..=0x1F | 0xA0..=0xAF => Ok(Self::Genoa),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "processor is not of know SEV-SNP model.",
+                )),
+            },
+            0x1A => match model {
+                0x0..=0x11 => Ok(Self::Turin),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "processor is not of know SEV-SNP model.",
+                )),
+            },
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "processor is not of know SEV-SNP generation.",
+            )),
+        }
+    }
+
+    /// Identify the EPYC processor generation based on the CPUID instruction.
+    #[cfg(feature = "snp")]
+    pub fn identify_host_generation() -> Result<Self, std::io::Error> {
+        use std::convert::TryInto;
+
+        let raw_cpuid = unsafe { std::arch::x86_64::__cpuid(0x8000_0001) }
+            .eax
+            .to_le_bytes();
+        raw_cpuid.as_slice().try_into()
+    }
 }
 
 #[cfg(all(feature = "sev", feature = "openssl"))]

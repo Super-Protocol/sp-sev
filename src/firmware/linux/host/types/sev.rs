@@ -3,14 +3,14 @@
 #[cfg(target_os = "linux")]
 use crate::certs::sev::sev;
 
-use crate::Version;
+use crate::firmware::host::Version;
 
 #[cfg(target_os = "linux")]
 use std::marker::PhantomData;
 
 bitflags::bitflags! {
     /// The platform's status flags.
-    #[derive(Default)]
+    #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
     pub struct PlatformStatusFlags: u32 {
         /// If set, this platform is owned. Otherwise, it is self-owned.
         const OWNED           = 1 << 0;

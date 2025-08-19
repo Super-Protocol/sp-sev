@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use bincode;
 #[cfg(feature = "openssl")]
 use openssl::error::ErrorStack;
 use std::{
@@ -117,7 +116,7 @@ impl Display for VmmError {
 
 /// The raw firmware error.
 #[derive(Debug)]
-pub(crate) struct RawFwError(u64);
+pub(crate) struct RawFwError(pub(crate) u64);
 
 impl std::error::Error for RawFwError {}
 
@@ -536,6 +535,9 @@ pub enum UserApiError {
     /// Invalid VMPL.
     VmplError,
 
+    /// Attestation Report Error
+    AttestationReportError(AttestationReportError),
+
     /// Unknown error
     Unknown,
 }
@@ -550,6 +552,7 @@ impl error::Error for UserApiError {
             Self::VmmError(vmm_error) => Some(vmm_error),
             Self::HashstickError(hashstick_error) => Some(hashstick_error),
             Self::VmplError => None,
+            Self::AttestationReportError(attestation_error) => Some(attestation_error),
             Self::Unknown => None,
         }
     }
@@ -565,6 +568,9 @@ impl std::fmt::Display for UserApiError {
             Self::VmmError(error) => format!("VMM Error Encountered: {error}"),
             Self::HashstickError(error) => format!("VLEK Hashstick Error Encountered: {error}"),
             Self::VmplError => "Invalid VM Permission Level (VMPL)".to_string(),
+            Self::AttestationReportError(error) => {
+                format!("Attestation Report Error Encountered: {error}")
+            }
             Self::Unknown => "Unknown Error Encountered!".to_string(),
         };
         write!(f, "{err_msg}")
@@ -619,6 +625,12 @@ impl std::convert::From<CertError> for UserApiError {
     }
 }
 
+impl std::convert::From<AttestationReportError> for UserApiError {
+    fn from(attestation_error: AttestationReportError) -> Self {
+        Self::AttestationReportError(attestation_error)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 /// Errors which may be encountered when handling Version Loaded Endorsement Keys
 /// (VLEK) Hashsticks.
@@ -628,6 +640,9 @@ pub enum HashstickError {
 
     /// No hashstick was provided
     EmptyHashstickBuffer,
+
+    /// Invalid reserved field in the hashstick.
+    InvalidReservedField,
 
     /// Unknown Error.
     UnknownError,
@@ -645,6 +660,9 @@ impl std::fmt::Display for HashstickError {
                 )
             }
             HashstickError::EmptyHashstickBuffer => write!(f, "Hashstick buffer is empty."),
+            HashstickError::InvalidReservedField => {
+                write!(f, "Reserved field in the VLEK Hashstick is invalid.")
+            }
             HashstickError::UnknownError => {
                 write!(
                     f,
@@ -698,6 +716,47 @@ impl std::fmt::Display for CertError {
 }
 
 impl error::Error for CertError {}
+
+#[derive(Debug)]
+/// Errors which may be encountered when handling attestation reports
+pub enum AttestationReportError {
+    /// Bincode Error Handling
+    BincodeError(BincodeError),
+
+    /// Unsuported Attestation Report Version
+    UnsupportedReportVersion(u32),
+
+    /// Field is not supported in the current version of the Attestation Report
+    UnsupportedField(String),
+
+    /// MASK_CHIP_ID enabled
+    MaskedChipId,
+}
+
+impl std::fmt::Display for AttestationReportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            AttestationReportError::BincodeError(e) => write!(f, "Bincode error encountered: {e}"),
+            AttestationReportError::MaskedChipId => write!(f, "MASK_CHIP_ID is enabled, preventing the identification of the CPU generation."),
+            AttestationReportError::UnsupportedReportVersion(version) => write!(f, "The encountered Attestation Report version {version} is not supported by the library yet."),
+            AttestationReportError::UnsupportedField(field) => write!(f,"The field {field} is not supported in the provided Attestation Report version"),
+        }
+    }
+}
+
+impl From<AttestationReportError> for std::io::Error {
+    fn from(value: AttestationReportError) -> Self {
+        std::io::Error::new(std::io::ErrorKind::Other, value)
+    }
+}
+
+impl std::convert::From<bincode::error::DecodeError> for AttestationReportError {
+    fn from(value: bincode::error::DecodeError) -> Self {
+        Self::BincodeError(BincodeError::DecodeError(value))
+    }
+}
+
+impl error::Error for AttestationReportError {}
 
 #[derive(Debug)]
 /// Errors which may be encountered when building custom guest context.
@@ -823,7 +882,7 @@ impl std::error::Error for SevHashError {}
 
 /// Possible errors when working with the large array type
 #[derive(Debug)]
-pub enum LargeArrayError {
+pub enum ArrayError {
     /// Error when trying from slice
     SliceError(TryFromSliceError),
 
@@ -831,22 +890,22 @@ pub enum LargeArrayError {
     VectorError(String),
 }
 
-impl std::fmt::Display for LargeArrayError {
+impl std::fmt::Display for ArrayError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            LargeArrayError::SliceError(error) => {
+            ArrayError::SliceError(error) => {
                 write!(f, "Error when trying from slice: {error}")
             }
-            LargeArrayError::VectorError(error) => {
+            ArrayError::VectorError(error) => {
                 write!(f, "Error when trying from vector: {error}")
             }
         }
     }
 }
 
-impl std::error::Error for LargeArrayError {}
+impl std::error::Error for ArrayError {}
 
-impl std::convert::From<TryFromSliceError> for LargeArrayError {
+impl std::convert::From<TryFromSliceError> for ArrayError {
     fn from(value: TryFromSliceError) -> Self {
         Self::SliceError(value)
     }
@@ -860,13 +919,13 @@ pub enum IdBlockError {
     CryptoErrorStack(openssl::error::ErrorStack),
 
     /// Large Array Error handling
-    LargeArrayError(LargeArrayError),
+    LargeArrayError(ArrayError),
 
     /// File Error Handling
     FileError(std::io::Error),
 
     /// Bincode Error Handling
-    BincodeError(bincode::ErrorKind),
+    BincodeError(BincodeError),
 
     /// TryFrom Slice Error handling
     FromSliceError(TryFromSliceError),
@@ -906,8 +965,8 @@ impl std::convert::From<openssl::error::ErrorStack> for IdBlockError {
     }
 }
 
-impl std::convert::From<LargeArrayError> for IdBlockError {
-    fn from(value: LargeArrayError) -> Self {
+impl std::convert::From<ArrayError> for IdBlockError {
+    fn from(value: ArrayError) -> Self {
         Self::LargeArrayError(value)
     }
 }
@@ -918,15 +977,52 @@ impl std::convert::From<std::io::Error> for IdBlockError {
     }
 }
 
-impl std::convert::From<bincode::ErrorKind> for IdBlockError {
-    fn from(value: bincode::ErrorKind) -> Self {
-        Self::BincodeError(value)
-    }
-}
-
 impl std::convert::From<TryFromSliceError> for IdBlockError {
     fn from(value: TryFromSliceError) -> Self {
         Self::FromSliceError(value)
+    }
+}
+
+/// Errors when decoding/encoding binary data
+#[derive(Debug)]
+pub enum BincodeError {
+    /// Error when decoding binary data
+    DecodeError(bincode::error::DecodeError),
+
+    /// Error when encoding binary data
+    EncodeError(bincode::error::EncodeError),
+}
+
+impl std::fmt::Display for BincodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::DecodeError(e) => write!(f, "Bincode decode error: {e}"),
+            Self::EncodeError(e) => write!(f, "Bincode encode error: {e}"),
+        }
+    }
+}
+
+impl From<bincode::error::DecodeError> for MeasurementError {
+    fn from(e: bincode::error::DecodeError) -> Self {
+        Self::BincodeError(BincodeError::DecodeError(e))
+    }
+}
+
+impl From<bincode::error::EncodeError> for MeasurementError {
+    fn from(e: bincode::error::EncodeError) -> Self {
+        Self::BincodeError(BincodeError::EncodeError(e))
+    }
+}
+
+impl From<bincode::error::DecodeError> for IdBlockError {
+    fn from(e: bincode::error::DecodeError) -> Self {
+        Self::BincodeError(BincodeError::DecodeError(e))
+    }
+}
+
+impl From<bincode::error::EncodeError> for IdBlockError {
+    fn from(e: bincode::error::EncodeError) -> Self {
+        Self::BincodeError(BincodeError::EncodeError(e))
     }
 }
 
@@ -940,7 +1036,7 @@ pub enum MeasurementError {
     UUIDError(uuid::Error),
 
     /// Bincode Error Handling
-    BincodeError(bincode::ErrorKind),
+    BincodeError(BincodeError),
 
     /// File Error Handling
     FileError(std::io::Error),
@@ -961,7 +1057,7 @@ pub enum MeasurementError {
     IdBlockError(IdBlockError),
 
     /// Large Array Error handling
-    LargeArrayError(LargeArrayError),
+    LargeArrayError(ArrayError),
 
     /// Invalid VCPU provided
     InvalidVcpuTypeError(String),
@@ -1035,12 +1131,6 @@ impl std::convert::From<uuid::Error> for MeasurementError {
     }
 }
 
-impl std::convert::From<bincode::ErrorKind> for MeasurementError {
-    fn from(value: bincode::ErrorKind) -> Self {
-        Self::BincodeError(value)
-    }
-}
-
 impl std::convert::From<std::io::Error> for MeasurementError {
     fn from(value: std::io::Error) -> Self {
         Self::FileError(value)
@@ -1077,8 +1167,8 @@ impl std::convert::From<IdBlockError> for MeasurementError {
     }
 }
 
-impl std::convert::From<LargeArrayError> for MeasurementError {
-    fn from(value: LargeArrayError) -> Self {
+impl std::convert::From<ArrayError> for MeasurementError {
+    fn from(value: ArrayError) -> Self {
         Self::LargeArrayError(value)
     }
 }
@@ -1120,7 +1210,7 @@ impl From<ErrorStack> for SessionError {
 
 #[cfg(test)]
 mod tests {
-    use bincode::ErrorKind;
+    use bincode::error::DecodeError;
 
     use super::*;
     use std::{
@@ -1364,7 +1454,7 @@ mod tests {
         let slice_err: Result<[u8; 2], TryFromSliceError> = vec![1u8].as_slice().try_into();
         let variants = vec![
             slice_err.unwrap_err().into(),
-            LargeArrayError::VectorError("test".into()),
+            ArrayError::VectorError("test".into()),
         ];
 
         for err in variants {
@@ -1376,10 +1466,10 @@ mod tests {
     #[test]
     fn test_id_block_error_complete() {
         let slice_err: Result<[u8; 2], TryFromSliceError> = vec![1u8].as_slice().try_into();
-        let bincode_err: ErrorKind = bincode::ErrorKind::Custom("test".into());
+        let bincode_err: DecodeError = DecodeError::Other("test");
 
         let variants = vec![
-            LargeArrayError::VectorError("test".into()).into(),
+            ArrayError::VectorError("test".into()).into(),
             std::io::Error::new(std::io::ErrorKind::Other, "test").into(),
             bincode_err.into(),
             slice_err.unwrap_err().into(),
@@ -1393,7 +1483,7 @@ mod tests {
         }
 
         // Test conversions
-        let arr_err = LargeArrayError::VectorError("test".into());
+        let arr_err = ArrayError::VectorError("test".into());
         assert!(matches!(
             IdBlockError::from(arr_err),
             IdBlockError::LargeArrayError(_)
@@ -1403,7 +1493,7 @@ mod tests {
     #[test]
     fn test_measurement_error_complete() {
         let slice_err: Result<[u8; 2], TryFromSliceError> = vec![1u8].as_slice().try_into();
-        let bincode_err: ErrorKind = bincode::ErrorKind::Custom("test".into());
+        let bincode_err: DecodeError = DecodeError::Other("test");
 
         let uuid_err = uuid::Uuid::try_from("").unwrap_err();
 
@@ -1417,7 +1507,7 @@ mod tests {
             OVMFError::UnknownError.into(),
             SevHashError::UnknownError.into(),
             IdBlockError::SevCurveError().into(),
-            LargeArrayError::VectorError("test".into()).into(),
+            ArrayError::VectorError("test".into()).into(),
             MeasurementError::InvalidVcpuTypeError("test".into()),
             MeasurementError::InvalidVcpuSignatureError("test".into()),
             MeasurementError::InvalidVmmError("test".into()),

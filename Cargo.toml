@@ -1,6 +1,6 @@
 [package]
 name = "sev"
-version = "5.0.0"
+version = "6.2.1"
 authors = [
     "Nathaniel McCallum <npmccallum@redhat.com>",
     "The VirTEE Project Developers",
@@ -20,7 +20,7 @@ categories = [
     "hardware-support",
 ]
 exclude = [".gitignore", ".github/*"]
-rust-version = "1.80.0"
+rust-version = "1.85.0"
 
 [badges]
 # See https://doc.rust-lang.org/cargo/reference/manifest.html#the-badges-section
@@ -45,20 +45,20 @@ snp = []
 crypto_nossl = ["dep:p384", "dep:rsa", "dep:sha2", "dep:x509-cert"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
-iocuddle = "0.1"
+iocuddle = "^0.1"
 
 [dependencies]
-openssl = { version = "0.10", optional = true }
+openssl = { version = "0.10", optional = true, features = ["vendored"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11"
-bitflags = "1.2"
+bitflags = "2.9.0"
 codicon = "3.0"
-dirs = "5.0"
+dirs = "^6.0"
 serde-big-array = "0.5.1"
 static_assertions = "^1.1.0"
-bitfield = "^0.15"
+bitfield = "^0.19"
 uuid = { version = "^1.11", features = ["serde"] }
-bincode = "^1.3"
+bincode = { version = "^2.0", features = ["serde"] }
 hex = "0.4.3"
 libc = "0.2.161"
 lazy_static = "1.4.0"
@@ -69,12 +69,12 @@ x509-cert = { version = "0.2.5", optional = true }
 byteorder = "1.4.3"
 base64 = "0.22.1"
 rdrand = { version = "^0.8", optional = true }
-reqwest = { version="0.11.10", features = ["blocking"], optional = true }
-tokio = {version = "1.29.1", features =["rt-multi-thread"], optional = true }
+reqwest = { version = "^0.12", features = ["blocking"], optional = true }
+tokio = { version = "1.29.1", features = ["rt-multi-thread"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 kvm-ioctls = ">=0.16"
+kvm-bindings = "^0.11"
 
 [dev-dependencies]
-kvm-bindings = ">=0.9.1"
 serial_test = "3.0"

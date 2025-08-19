@@ -1,41 +1,54 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::firmware::guest::{parse_tcb, write_tcb};
+pub(crate) use crate::firmware::linux::host as FFI;
 /// A representation of the type of data provided to [parse_table](crate::firmware::host::parse_table)
 pub use crate::firmware::linux::host::types::RawData;
-
-pub(crate) use crate::firmware::linux::host as FFI;
-
-use crate::Version;
+use bincode::{Decode, Encode};
 
 #[cfg(target_os = "linux")]
 use crate::error::CertError;
+use crate::{
+    util::{
+        array::Array,
+        parser::{ByteParser, ReadExt, WriteExt},
+    },
+    Generation,
+};
 
 use std::{
     convert::{TryFrom, TryInto},
     fmt::{self, Display, Formatter},
+    io::Write,
+    ops::BitOrAssign,
 };
 
 use bitfield::bitfield;
-
-use bitflags;
 
 use serde::{Deserialize, Serialize};
 
 use self::FFI::types::SnpSetConfig;
 
-bitflags::bitflags! {
+bitfield! {
     /// The platform's status flags.
     #[derive(Default)]
-    pub struct SnpPlatformStatusFlags: u32 {
-        /// If set, this platform is owned. Otherwise, it is self-owned.
-        const OWNED           = 1 << 0;
+    pub struct SnpPlatformStatusFlags(u32);
+    impl Debug;
 
-        /// If set, encrypted state functionality is present.
-        const ENCRYPTED_STATE = 1 << 8;
+    /// If set, this platform is owned. Otherwise, it is self-owned.
+    pub is_owned, _: 0;
+
+    /// If set, encrypted state functionality is present.
+    pub is_encrypted_state_present, _: 8;
+}
+
+impl BitOrAssign for SnpPlatformStatusFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Encode, Decode)]
 #[repr(C)]
 /// Certificates which are accepted for [CertTableEntry](self::CertTableEntry)
 pub enum CertType {
@@ -58,7 +71,7 @@ pub enum CertType {
     CRL,
 
     /// Other (Specify GUID)
-    OTHER(uuid::Uuid),
+    OTHER(#[bincode(with_serde)] uuid::Uuid),
 }
 
 impl Display for CertType {
@@ -140,7 +153,7 @@ impl PartialOrd for CertType {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Encode, Decode)]
 #[repr(C)]
 /// An entry with information regarding a specific certificate.
 pub struct CertTableEntry {
@@ -164,11 +177,10 @@ impl CertTableEntry {
 
     /// Generates a certificate from the str GUID and data provided.
     pub fn from_guid(guid: &uuid::Uuid, data: Vec<u8>) -> Result<Self, uuid::Error> {
-        let cert_type: CertType = match guid.try_into() {
-            Ok(guid) => guid,
-            Err(error) => return Err(error),
-        };
-        Ok(Self { cert_type, data })
+        Ok(Self {
+            cert_type: guid.try_into()?,
+            data,
+        })
     }
 
     /// Generates a certificate from the CertType and data provided.
@@ -205,7 +217,7 @@ impl PartialOrd for CertTableEntry {
 }
 
 /// Information regarding the SEV-SNP platform's TCB version.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct TcbStatus {
     /// Installed TCB version.
     pub platform_version: TcbVersion,
@@ -214,43 +226,63 @@ pub struct TcbStatus {
     pub reported_version: TcbVersion,
 }
 
-/// A description of the SEV-SNP platform's build information.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
-pub struct Build {
-    /// The version information.
-    pub version: Version,
-
-    /// The build ID.
-    pub build: u32,
-}
-
-bitflags::bitflags! {
+bitfield! {
     /// Various platform initialization configuration data. Byte 0x3 in SEV-SNP's
     /// STRUCT_PLATFORM_STATUS.
-    #[derive(Default)]
-    pub struct PlatformInit: u8 {
-        /// Indicates if RMP is initialized.
-        const IS_RMP_INIT           = 1 << 0;
-        /// Indicates that alias detection has completed since the last system reset
-        /// and there are no aliasing addresses. Resets to 0.
-        /// Added in firmware version:
-        ///     Milan family: 1.55.22
-        ///     Genoa family: 1.55.38
-        const ALIAS_CHECK_COMPLETE  = 1 << 1;
-        /// Indicates TIO is enabled. Present if SevTio feature bit is set.
-        const IS_TIO_EN             = 1 << 3;
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    pub struct PlatformInit(u8);
+    impl Debug;
+
+    /// Indicates if RMP is initialized.
+    pub is_rmp_init, _: 0;
+
+    /// Indicates that alias detection has completed since the last system reset
+    /// and there are no aliasing addresses. Resets to 0.
+    /// Added in firmware version:
+    ///     Milan family: 1.55.22
+    ///     Genoa family: 1.55.38
+    pub alias_check_complete, _: 1;
+
+    /// Indicates TIO is enabled. Present if SevTio feature bit is set.
+    pub is_tio_en, _: 3;
+}
+
+impl BitOrAssign for PlatformInit {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+impl ByteParser for PlatformInit {
+    type Bytes = [u8; 1];
+
+    fn from_bytes(bytes: Self::Bytes) -> Self {
+        Self(u8::from_le_bytes(bytes))
+    }
+
+    fn to_bytes(&self) -> Self::Bytes {
+        self.0.to_le_bytes()
+    }
+
+    fn default() -> Self {
+        Self(Default::default())
+    }
+}
+
+impl Default for PlatformInit {
+    fn default() -> Self {
+        Self(ByteParser::default())
     }
 }
 
 /// Query the SEV-SNP platform status.
 ///
 /// (Chapter 8.3; Table 38)
-#[derive(Default, Debug)]
+#[derive(Default, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(C)]
 pub struct SnpPlatformStatus {
     /// The firmware API version (major.minor)
-    pub version: Version,
+    pub version: (u8, u8),
 
     /// The platform state.
     pub state: u8,
@@ -261,8 +293,8 @@ pub struct SnpPlatformStatus {
     /// The platform build ID.
     pub build_id: u32,
 
-    /// MaskChipId
-    pub mask_chip_id: u32,
+    /// PlatforPolicy of the machine
+    pub platform_policy: PlatformPolicy,
 
     /// The number of valid guests maintained by the SEV-SNP firmware.
     pub guest_count: u32,
@@ -272,6 +304,41 @@ pub struct SnpPlatformStatus {
 
     /// Reported TCB version.
     pub reported_tcb_version: TcbVersion,
+}
+#[cfg(feature = "snp")]
+impl TryFrom<(Generation, &[u8])> for SnpPlatformStatus {
+    type Error = std::io::Error;
+
+    fn try_from(mut value: (Generation, &[u8])) -> Result<Self, Self::Error> {
+        //Cast FFI type to rust friendly type
+        let stepper: &mut &[u8] = &mut value.1;
+        let major: u8 = stepper.parse_bytes()?;
+        let minor: u8 = stepper.parse_bytes()?;
+
+        // Find generation from CPUID
+        Ok(match value.0 {
+            Generation::Turin => Self {
+                version: (major, minor),
+                state: stepper.parse_bytes()?,
+                is_rmp_init: stepper.parse_bytes()?,
+                build_id: stepper.parse_bytes()?,
+                platform_policy: stepper.parse_bytes()?,
+                guest_count: stepper.parse_bytes()?,
+                platform_tcb_version: TcbVersion::from_turin_bytes(&stepper.parse_bytes()?),
+                reported_tcb_version: TcbVersion::from_turin_bytes(&stepper.parse_bytes()?),
+            },
+            _ => Self {
+                version: (major, minor),
+                state: stepper.parse_bytes()?,
+                is_rmp_init: stepper.parse_bytes()?,
+                build_id: stepper.parse_bytes()?,
+                platform_policy: stepper.parse_bytes()?,
+                guest_count: stepper.parse_bytes()?,
+                platform_tcb_version: TcbVersion::from_legacy_bytes(&stepper.parse_bytes()?),
+                reported_tcb_version: TcbVersion::from_legacy_bytes(&stepper.parse_bytes()?),
+            },
+        })
+    }
 }
 
 /// Sets the system wide configuration values for SNP.
@@ -311,13 +378,22 @@ impl Config {
 }
 
 #[cfg(feature = "snp")]
-impl TryFrom<Config> for FFI::types::SnpSetConfig {
-    type Error = uuid::Error;
+/// TryFrom to FFI Config when manually passing in the CPU generation
+impl TryFrom<(Config, Generation)> for FFI::types::SnpSetConfig {
+    type Error = std::io::Error;
 
-    fn try_from(value: Config) -> Result<Self, Self::Error> {
+    fn try_from(args: (Config, Generation)) -> Result<Self, Self::Error> {
         let mut snp_config: SnpSetConfig = Default::default();
+        let (value, generation) = args;
 
-        snp_config.reported_tcb = value.reported_tcb;
+        let mut buffer = Vec::new();
+        write_tcb(&mut buffer, &value.reported_tcb, &generation)?;
+        snp_config.reported_tcb = buffer.try_into().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Failed to convert TCB into bytes",
+            )
+        })?;
         snp_config.mask_id = value.mask_id;
 
         Ok(snp_config)
@@ -325,12 +401,53 @@ impl TryFrom<Config> for FFI::types::SnpSetConfig {
 }
 
 #[cfg(feature = "snp")]
+/// TryFrom to FFI Config type when CPU Generation is unknown
+impl TryFrom<Config> for FFI::types::SnpSetConfig {
+    type Error = std::io::Error;
+
+    fn try_from(value: Config) -> Result<Self, Self::Error> {
+        let mut snp_config: SnpSetConfig = Default::default();
+        let generation = Generation::identify_host_generation()?;
+
+        let mut buffer = Vec::new();
+        write_tcb(&mut buffer, &value.reported_tcb, &generation)?;
+        snp_config.reported_tcb = buffer.try_into().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Failed to convert TCB into bytes",
+            )
+        })?;
+        snp_config.mask_id = value.mask_id;
+
+        Ok(snp_config)
+    }
+}
+
+#[cfg(feature = "snp")]
+/// TryFrom from FFI Config type when CPU Generation is manually passed in
+impl TryFrom<(FFI::types::SnpSetConfig, Generation)> for Config {
+    type Error = std::io::Error;
+
+    fn try_from(value: (FFI::types::SnpSetConfig, Generation)) -> Result<Self, Self::Error> {
+        let reported_tcb = parse_tcb(&mut value.0.reported_tcb.as_slice(), &value.1)?;
+        Ok(Self {
+            reported_tcb,
+            mask_id: value.0.mask_id,
+            ..Default::default()
+        })
+    }
+}
+
+#[cfg(feature = "snp")]
+/// TryFrom from FFI Config type when CPU Generation is unknown
 impl TryFrom<FFI::types::SnpSetConfig> for Config {
-    type Error = uuid::Error;
+    type Error = std::io::Error;
 
     fn try_from(value: FFI::types::SnpSetConfig) -> Result<Self, Self::Error> {
+        let generation = Generation::identify_host_generation()?;
+        let reported_tcb = parse_tcb(&mut value.reported_tcb.as_slice(), &generation)?;
         Ok(Self {
-            reported_tcb: value.reported_tcb,
+            reported_tcb,
             mask_id: value.mask_id,
             ..Default::default()
         })
@@ -340,16 +457,31 @@ impl TryFrom<FFI::types::SnpSetConfig> for Config {
 /// TcbVersion represents the version of the firmware.
 ///
 /// (Chapter 2.2; Table 3)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Default,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    Decode,
+    Encode,
+)]
 #[repr(C)]
 pub struct TcbVersion {
+    /// Current FMC fw version
+    /// SVN of FMC fw
+    pub fmc: Option<u8>,
     /// Current bootloader version.
     /// SVN of PSP bootloader.
     pub bootloader: u8,
     /// Current PSP OS version.
     /// SVN of PSP operating system.
     pub tee: u8,
-    _reserved: [u8; 4],
     /// Version of the SNP firmware.
     /// Security Version Number (SVN) of SNP firmware.
     pub snp: u8,
@@ -357,31 +489,82 @@ pub struct TcbVersion {
     pub microcode: u8,
 }
 
+impl TcbVersion {
+    pub(crate) fn from_legacy_bytes(bytes: &[u8; 8]) -> Self {
+        Self {
+            fmc: None,
+            bootloader: bytes[0],
+            tee: bytes[1],
+            snp: bytes[6],
+            microcode: bytes[7],
+        }
+    }
+
+    pub(crate) fn to_legacy_bytes(self) -> [u8; 8] {
+        [
+            self.bootloader,
+            self.tee,
+            0,
+            0,
+            0,
+            0,
+            self.snp,
+            self.microcode,
+        ]
+    }
+
+    pub(crate) fn from_turin_bytes(bytes: &[u8; 8]) -> Self {
+        Self {
+            fmc: Some(bytes[0]),
+            bootloader: bytes[1],
+            tee: bytes[2],
+            snp: bytes[3],
+            microcode: bytes[7],
+        }
+    }
+
+    pub(crate) fn to_turin_bytes(self) -> [u8; 8] {
+        [
+            self.fmc.unwrap_or(0),
+            self.bootloader,
+            self.tee,
+            self.snp,
+            0,
+            0,
+            0,
+            self.microcode,
+        ]
+    }
+}
+
 impl Display for TcbVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            r#"
-TCB Version:
+            r#"TCB Version:
   Microcode:   {}
   SNP:         {}
   TEE:         {}
   Boot Loader: {}
-  "#,
-            self.microcode, self.snp, self.tee, self.bootloader
+  FMC:         {}"#,
+            self.microcode,
+            self.snp,
+            self.tee,
+            self.bootloader,
+            self.fmc.map_or("None".to_string(), |fmc| fmc.to_string())
         )
     }
 }
 
 impl TcbVersion {
     /// Creates a new instance of a TcbVersion
-    pub fn new(bootloader: u8, tee: u8, snp: u8, microcode: u8) -> Self {
+    pub fn new(fmc: Option<u8>, bootloader: u8, tee: u8, snp: u8, microcode: u8) -> Self {
         Self {
+            fmc,
             bootloader,
             tee,
             snp,
             microcode,
-            _reserved: Default::default(),
         }
     }
 }
@@ -394,13 +577,35 @@ bitfield! {
     /// |0|MASK_CHIP_ID|Indicates that the CHIP_ID field in the attestation report will alwaysbe zero.|
     /// |1|MASK_CHIP_KEY|Indicates that the VCEK is not used in attestation and guest key derivation.|
     #[repr(C)]
-    #[derive(Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Decode, Encode)]
     pub struct MaskId(u32);
     impl Debug;
     /// Indicates that the CHIP_ID field in the attestation report will alwaysbe zero.
-    pub mask_chip_id, _: 0, 0;
+    pub mask_chip_id, _: 0;
     /// Indicates that the VCEK is not used in attestation and guest key derivation.
-    pub mask_chip_key, _: 1, 1;
+    pub mask_chip_key, _: 1;
+}
+
+impl Default for MaskId {
+    fn default() -> Self {
+        Self(ByteParser::default())
+    }
+}
+
+impl ByteParser for MaskId {
+    type Bytes = [u8; 4];
+
+    fn from_bytes(bytes: Self::Bytes) -> Self {
+        Self(u32::from_le_bytes(bytes))
+    }
+
+    fn to_bytes(&self) -> Self::Bytes {
+        self.0.to_le_bytes()
+    }
+
+    fn default() -> Self {
+        Self(0)
+    }
 }
 
 impl Display for MaskId {
@@ -418,9 +623,168 @@ impl Display for MaskId {
     }
 }
 
+bitfield! {
+    /// Policy settings that appear in SNP PLATFORM STATUS
+    ///
+    /// | Bit(s) | Name | Description |
+    /// |--------|------|-------------|
+    /// |0|MASK_CHIP_ID|Set to the value of MaskChipID.|
+    /// |1|MASK_CHIP_KEY|Set to the value of MaskChipKey.|
+    /// |2|VLEK_EN|Indicates whether a VLEK hashtick is loaded|
+    /// |3|FEATURE_INFO|Indicates that the SNP_FEATURE_INFO command is available.|
+    /// |4|RAPL_DIS|Indicates that the RAPL is disabled.|
+    /// |5|CIPHERTEXT_HIDING_DRAM_CAP|Indicates platform capable of ciphertext hiding for the DRAM.|
+    /// |6|CIPHERTEXT_HIDING_DRAM_EN|Indicates ciphertext hiding is enabled for the DRAM.|
+    /// |31:7|-|Reserved.|
+    #[repr(C)]
+    #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct PlatformPolicy(u32);
+    impl Debug;
+    /// Indicates that the CHIP_ID field in the attestation report will alwaysbe zero.
+    pub mask_chip_id, _: 0;
+    /// Indicates that the VCEK is not used in attestation and guest key derivation.
+    pub mask_chip_key, _: 1;
+    /// Indicates whether a VLEK hashtick is loaded
+    pub vlek_en, _: 2;
+    /// Indicates that the SNP_FEATURE_INFO command is available.
+    pub feature_info, _: 3;
+    /// Indicates that the RAPL is disabled.
+    pub rapl_dis, _: 4;
+    /// Indicates platform capable of ciphertext hiding for the DRAM.
+    pub ciphertext_hiding_dram_cap, _: 5;
+    /// Indicates ciphertext hiding is enabled for the DRAM.
+    pub ciphertext_hiding_dram_en, _: 6;
+    /// Indicates TIO is enbaled. Present if SEV-TIO feature bit is set.
+    pub is_tio_en, _: 7;
+}
+
+impl Default for PlatformPolicy {
+    fn default() -> Self {
+        Self(ByteParser::default())
+    }
+}
+
+impl ByteParser for PlatformPolicy {
+    type Bytes = [u8; 4];
+
+    fn from_bytes(bytes: Self::Bytes) -> Self {
+        Self(u32::from_le_bytes(bytes))
+    }
+
+    fn to_bytes(&self) -> Self::Bytes {
+        self.0.to_le_bytes()
+    }
+
+    fn default() -> Self {
+        Self(0)
+    }
+}
+
+impl Display for PlatformPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            r#"
+    MaskID ({}):
+    Mask Chip ID Enabled: {}
+    Mask Chip Key Enabled: {}
+    Vlek Enabled: {}
+    Feature Info Enabled {}
+    RAPL Disabled: {}
+    Ciphertext Capable: {}
+    Ciphertext enabled: {}
+    SEV-TIO enabled: {}"#,
+            self.0,
+            self.mask_chip_id(),
+            self.mask_chip_key(),
+            self.vlek_en(),
+            self.feature_info(),
+            self.rapl_dis(),
+            self.ciphertext_hiding_dram_cap(),
+            self.ciphertext_hiding_dram_en(),
+            self.is_tio_en()
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Wrapped VLEK Hashstick strucutre.
+/// As defined in AMD's SEV-SNP specification chapter 8.30
+/// An address to a buffer containing this structure is passed to the snp_vlek_load command.
+pub struct WrappedVlekHashstick {
+    /// IV used to wrap chip-unique key
+    pub iv: [u8; 12], // 96 bits = 12 bytes
+
+    /// VLEK hashstick wrapped with a chip-unique key using AES-256-GCM
+    pub vlek_wrapped: Array<u8, 384>,
+
+    /// The TCB version associated with this VLEK hashstick
+    pub tcb_version: TcbVersion,
+
+    /// AES-256-GCM authentication tag of the wrapped VLEK hashstick and TCB_VERSION
+    pub vlek_auth_tag: [u8; 16],
+}
+
+impl WrappedVlekHashstick {
+    /// Parses raw bytes into the WrappedVlekHashstick structure.
+    pub fn from_bytes(mut bytes: &[u8], generation: Generation) -> Result<Self, std::io::Error> {
+        if bytes.len() != 432usize {
+            return Err(std::io::ErrorKind::InvalidData)?;
+        }
+
+        let stepper = &mut bytes;
+
+        let iv: [u8; 12] = stepper.parse_bytes()?;
+        let vlek_wrapped: Array<u8, 384> = stepper.skip_bytes::<4>()?.parse_bytes()?;
+        let tcb_version = parse_tcb(stepper, &generation)?;
+        let vlek_auth_tag: [u8; 16] = stepper.skip_bytes::<8>()?.parse_bytes()?;
+
+        Ok(Self {
+            iv,
+            vlek_wrapped,
+            tcb_version,
+            vlek_auth_tag,
+        })
+    }
+
+    /// Writes the WrappedVlekHashstick structure to bytes.
+    pub fn write_bytes(
+        self,
+        mut handle: impl Write,
+        generation: Generation,
+    ) -> Result<(), std::io::Error> {
+        handle.write_bytes(self.iv)?;
+        handle.skip_bytes::<4>()?.write_bytes(self.vlek_wrapped)?;
+
+        write_tcb(&mut handle, &self.tcb_version, &generation)?;
+
+        handle.skip_bytes::<8>()?.write_bytes(self.vlek_auth_tag)?;
+
+        Ok(())
+    }
+}
+
+impl Display for WrappedVlekHashstick {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            r#"
+    Wrapped VLEK Hashstick:
+    IV:                      {:?}
+    VLEK hashstic Wrapped:   {}
+    TCB: 
+    {}
+    VLEK authentication tag: {:?}"#,
+            self.iv, self.vlek_wrapped, self.tcb_version, self.vlek_auth_tag
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::BINCODE_CFG;
     use uuid::Uuid;
 
     #[test]
@@ -479,24 +843,20 @@ mod tests {
 
     #[test]
     fn test_snp_platform_status_flags_zeroed() {
-        let actual: SnpPlatformStatusFlags = SnpPlatformStatusFlags { bits: 0 };
+        let actual: SnpPlatformStatusFlags = SnpPlatformStatusFlags(0);
 
-        assert_eq!((actual & SnpPlatformStatusFlags::OWNED).bits(), 0);
-        assert_eq!((actual & SnpPlatformStatusFlags::ENCRYPTED_STATE).bits(), 0);
+        assert!(!actual.is_owned());
+        assert!(!actual.is_encrypted_state_present());
     }
 
     #[test]
     fn test_snp_platform_status_flags_full() {
-        let mut actual: SnpPlatformStatusFlags = SnpPlatformStatusFlags { bits: 0 };
+        let mut actual: SnpPlatformStatusFlags = SnpPlatformStatusFlags(0);
 
-        actual |= SnpPlatformStatusFlags::OWNED;
-        actual |= SnpPlatformStatusFlags::ENCRYPTED_STATE;
-
-        assert_eq!((actual & SnpPlatformStatusFlags::OWNED).bits(), 1);
-        assert_eq!(
-            (actual & SnpPlatformStatusFlags::ENCRYPTED_STATE).bits(),
-            1 << 8
-        );
+        actual.0 |= 1;
+        actual.0 |= 1 << 8;
+        assert!(actual.is_owned());
+        assert!(actual.is_encrypted_state_present());
     }
 
     #[test]
@@ -618,7 +978,7 @@ mod tests {
     // Test TcbVersion struct and methods
     #[test]
     fn test_tcb_version() {
-        let tcb = TcbVersion::new(1, 2, 3, 4);
+        let tcb = TcbVersion::new(None, 1, 2, 3, 4);
         assert_eq!(tcb.bootloader, 1);
         assert_eq!(tcb.tee, 2);
         assert_eq!(tcb.snp, 3);
@@ -634,7 +994,7 @@ mod tests {
     #[test]
     #[cfg(feature = "snp")]
     fn test_config() {
-        let tcb = TcbVersion::new(1, 2, 3, 4);
+        let tcb = TcbVersion::new(None, 1, 2, 3, 4);
         let mask = MaskId(0x3);
         let config = Config::new(tcb, mask);
 
@@ -643,8 +1003,8 @@ mod tests {
         assert_eq!(config_mask, mask);
 
         // Test conversion to FFI type
-        let snp_config: SnpSetConfig = config.try_into().unwrap();
-        assert_eq!(snp_config.reported_tcb, tcb);
+        let snp_config: SnpSetConfig = (config, Generation::Milan).try_into().unwrap();
+        assert_eq!(snp_config.reported_tcb, tcb.to_legacy_bytes());
         let snp_config_mask = snp_config.mask_id;
 
         assert_eq!(snp_config_mask, mask);
@@ -653,42 +1013,34 @@ mod tests {
     // Test PlatformInit flags
     #[test]
     fn test_platform_init() {
-        let mut init = PlatformInit::empty();
-        assert!(!init.contains(PlatformInit::IS_RMP_INIT));
+        let mut init = PlatformInit(0);
 
-        init.insert(PlatformInit::IS_RMP_INIT);
-        assert!(init.contains(PlatformInit::IS_RMP_INIT));
+        assert!(!init.is_rmp_init());
+        init.0 |= 1;
+        assert!(init.is_rmp_init());
 
-        init.insert(PlatformInit::IS_TIO_EN);
-        assert!(init.contains(PlatformInit::IS_TIO_EN));
+        assert!(!init.alias_check_complete());
+        init.0 |= 1 << 1;
+        assert!(init.alias_check_complete());
+
+        assert!(!init.is_tio_en());
+        init.0 |= 1 << 3;
+        assert!(init.is_tio_en());
     }
 
     // Test MaskId bitfield operations
     #[test]
     fn test_mask_id() {
         let mut mask = MaskId(0);
-        assert_eq!(mask.mask_chip_id(), 0);
+        assert!(!mask.mask_chip_id());
 
         mask.0 = 0x3;
-        assert_eq!(mask.mask_chip_id(), 1);
-        assert_eq!(mask.mask_chip_key(), 1);
+        assert!(mask.mask_chip_id());
+        assert!(mask.mask_chip_key());
 
         // Test Display implementation
         let display_output = format!("{}", mask);
         assert!(display_output.contains("MaskID (3)"));
-    }
-
-    // Test Build struct
-    #[test]
-    fn test_build() {
-        let build = Build {
-            version: Version { major: 1, minor: 2 },
-            build: 42,
-        };
-
-        assert_eq!(build.version.major, 1);
-        assert_eq!(build.version.minor, 2);
-        assert_eq!(build.build, 42);
     }
 
     // Test SnpPlatformStatus
@@ -699,15 +1051,15 @@ mod tests {
         assert_eq!(status.guest_count, 0);
 
         let init_status = SnpPlatformStatus {
-            is_rmp_init: PlatformInit::IS_RMP_INIT,
+            is_rmp_init: PlatformInit(1),
             ..Default::default()
         };
-        assert!(init_status.is_rmp_init.contains(PlatformInit::IS_RMP_INIT));
+        assert!(init_status.is_rmp_init.is_rmp_init());
     }
 
     #[test]
     fn test_tcb_version_creation_and_display() {
-        let tcb = TcbVersion::new(1, 2, 3, 4);
+        let tcb = TcbVersion::new(None, 1, 2, 3, 4);
         assert_eq!(tcb.bootloader, 1);
         assert_eq!(tcb.tee, 2);
         assert_eq!(tcb.snp, 3);
@@ -720,66 +1072,36 @@ mod tests {
         assert!(display.contains("Boot Loader: 1"));
     }
 
-    // Build Tests
-    #[test]
-    fn test_build_ordering_and_comparison() {
-        let build1 = Build {
-            version: Version { major: 1, minor: 0 },
-            build: 1,
-        };
-        let build2 = Build {
-            version: Version { major: 1, minor: 1 },
-            build: 1,
-        };
-        assert!(build1 < build2);
-
-        let default_build = Build::default();
-        assert_eq!(default_build.version.major, 0);
-        assert_eq!(default_build.build, 0);
-    }
-
-    // PlatformInit Tests
-    #[test]
-    fn test_platform_init_flags() {
-        let mut flags = PlatformInit::empty();
-        assert!(!flags.contains(PlatformInit::IS_RMP_INIT));
-
-        flags.insert(PlatformInit::IS_RMP_INIT | PlatformInit::IS_TIO_EN);
-        assert!(flags.contains(PlatformInit::IS_RMP_INIT));
-        assert!(flags.contains(PlatformInit::IS_TIO_EN));
-        assert!(!flags.contains(PlatformInit::ALIAS_CHECK_COMPLETE));
-    }
-
     // MaskId Tests
     #[test]
     fn test_mask_id_operations() {
         let mut mask = MaskId(0);
-        assert_eq!(mask.mask_chip_id(), 0);
-        assert_eq!(mask.mask_chip_key(), 0);
+        assert!(!mask.mask_chip_id());
+        assert!(!mask.mask_chip_key());
 
         mask.0 = 0x3;
-        assert_eq!(mask.mask_chip_id(), 1);
-        assert_eq!(mask.mask_chip_key(), 1);
+        assert!(mask.mask_chip_id());
+        assert!(mask.mask_chip_key());
 
         let display = format!("{}", mask);
         assert!(display.contains("MaskID (3)"));
-        assert!(display.contains("Mask Chip ID: 1"));
+        assert!(display.contains("Mask Chip ID: true"));
     }
 
     // Config Tests
     #[test]
     #[cfg(feature = "snp")]
     fn test_config_conversions() {
-        let tcb = TcbVersion::new(1, 2, 3, 4);
+        let tcb = TcbVersion::new(None, 1, 2, 3, 4);
         let mask = MaskId(0x3);
         let config = Config::new(tcb, mask);
 
-        let ffi_config: SnpSetConfig = config.try_into().unwrap();
-        assert_eq!(ffi_config.reported_tcb, tcb);
+        let ffi_config: SnpSetConfig = (config, Generation::Milan).try_into().unwrap();
+        assert_eq!(ffi_config.reported_tcb, tcb.to_legacy_bytes());
         let ffi_config_mask = ffi_config.mask_id;
         assert_eq!(ffi_config_mask, mask);
 
-        let converted_config: Config = ffi_config.try_into().unwrap();
+        let converted_config: Config = (ffi_config, Generation::Milan).try_into().unwrap();
         assert_eq!(converted_config.reported_tcb, tcb);
         let converted_config_mask = converted_config.mask_id;
         assert_eq!(converted_config_mask, mask);
@@ -792,64 +1114,128 @@ mod tests {
         assert_eq!(status.state, 0);
         assert_eq!(status.guest_count, 0);
 
-        status.is_rmp_init = PlatformInit::IS_RMP_INIT;
-        assert!(status.is_rmp_init.contains(PlatformInit::IS_RMP_INIT));
+        status.is_rmp_init = PlatformInit(1);
+        assert!(status.is_rmp_init.is_rmp_init());
 
-        status.platform_tcb_version = TcbVersion::new(1, 2, 3, 4);
+        status.platform_tcb_version = TcbVersion::new(None, 1, 2, 3, 4);
         assert_eq!(status.platform_tcb_version.snp, 3);
-    }
-
-    #[test]
-    fn test_platform_status_flags_operations() {
-        let mut flags = SnpPlatformStatusFlags::empty();
-        assert!(!flags.contains(SnpPlatformStatusFlags::OWNED));
-
-        flags.insert(SnpPlatformStatusFlags::OWNED);
-        assert!(flags.contains(SnpPlatformStatusFlags::OWNED));
-        assert!(!flags.contains(SnpPlatformStatusFlags::ENCRYPTED_STATE));
-
-        flags.insert(SnpPlatformStatusFlags::ENCRYPTED_STATE);
-        assert!(flags.contains(SnpPlatformStatusFlags::ENCRYPTED_STATE));
-
-        flags.remove(SnpPlatformStatusFlags::OWNED);
-        assert!(!flags.contains(SnpPlatformStatusFlags::OWNED));
     }
 
     #[test]
     fn test_tcb_status() {
         let status = TcbStatus {
-            platform_version: TcbVersion::new(1, 2, 3, 4),
-            reported_version: TcbVersion::new(5, 6, 7, 8),
+            platform_version: TcbVersion::new(None, 1, 2, 3, 4),
+            reported_version: TcbVersion::new(None, 5, 6, 7, 8),
         };
 
         assert_eq!(status.platform_version.bootloader, 1);
         assert_eq!(status.reported_version.bootloader, 5);
 
         let default_status = TcbStatus::default();
-        assert_eq!(default_status.platform_version, TcbVersion::default());
+        assert_eq!(default_status.platform_version, Default::default());
     }
 
     #[test]
     #[cfg(feature = "snp")]
     fn test_config_error_cases() {
-        let tcb = TcbVersion::new(255, 255, 255, 255);
+        let tcb = TcbVersion::new(None, 255, 255, 255, 255);
         let mask = MaskId(u32::MAX);
         let config = Config::new(tcb, mask);
 
-        let ffi_result: Result<SnpSetConfig, _> = config.try_into();
+        let ffi_result: Result<SnpSetConfig, _> = (config, Generation::Milan).try_into();
         assert!(ffi_result.is_ok());
 
         let default_config = Config::default();
-        assert_eq!(default_config.reported_tcb, TcbVersion::default());
+        assert_eq!(default_config.reported_tcb, Default::default());
         let default_config_mask_id = default_config.mask_id;
-        assert_eq!(default_config_mask_id, MaskId::default());
+        assert_eq!(default_config_mask_id, Default::default());
+    }
+
+    #[test]
+    #[cfg(feature = "snp")]
+    fn test_config_edge_cases() {
+        // Test with maximum values
+        let tcb = TcbVersion::new(Some(255), 255, 255, 255, 255);
+        let mask_id = MaskId(u32::MAX);
+        let config = Config::new(tcb, mask_id);
+
+        // Convert to SnpSetConfig
+        let result: Result<SnpSetConfig, _> = (config, Generation::Turin).try_into();
+        assert!(result.is_ok());
+        let snp_config = result.unwrap();
+
+        // Convert back to Config
+        let result: Result<Config, _> = (snp_config, Generation::Turin).try_into();
+        assert!(result.is_ok());
+        let round_trip = result.unwrap();
+
+        assert_eq!(round_trip.reported_tcb, tcb);
+        let round_trip_mask_id = round_trip.mask_id;
+        assert_eq!(round_trip_mask_id, mask_id);
+
+        // Test with minimum values
+        let tcb = TcbVersion::new(Some(0), 0, 0, 0, 0);
+        let mask_id = MaskId(0);
+        let config = Config::new(tcb, mask_id);
+
+        // Convert to SnpSetConfig
+        let result: Result<SnpSetConfig, _> = (config, Generation::Turin).try_into();
+        assert!(result.is_ok());
+        let snp_config = result.unwrap();
+
+        // Convert back to Config
+        let result: Result<Config, _> = (snp_config, Generation::Turin).try_into();
+        assert!(result.is_ok());
+        let round_trip = result.unwrap();
+
+        assert_eq!(round_trip.reported_tcb, tcb);
+        let round_trip_mask_id = round_trip.mask_id;
+        assert_eq!(round_trip_mask_id, mask_id);
+    }
+
+    #[test]
+    #[cfg(feature = "snp")]
+    fn test_different_generation_conversions() {
+        let tcb = TcbVersion::new(Some(1), 2, 3, 4, 5);
+        let mask_id = MaskId(0x3);
+        let config = Config::new(tcb, mask_id);
+
+        // Test all generations
+        let generations = [Generation::Milan, Generation::Genoa, Generation::Turin];
+
+        for generation in generations {
+            // Convert to SnpSetConfig
+            let snp_config: Result<SnpSetConfig, _> = (config, generation).try_into();
+            assert!(snp_config.is_ok());
+            let snp_config = snp_config.unwrap();
+
+            // Convert back to Config
+            let round_trip: Result<Config, _> = (snp_config, generation).try_into();
+            assert!(round_trip.is_ok());
+            let round_trip = round_trip.unwrap();
+
+            // For non-Turin generations, FMC will be lost in the conversion
+            match generation {
+                Generation::Turin => assert_eq!(round_trip.reported_tcb, tcb),
+                _ => {
+                    // FMC field is not preserved for legacy generations
+                    assert_eq!(round_trip.reported_tcb.bootloader, tcb.bootloader);
+                    assert_eq!(round_trip.reported_tcb.tee, tcb.tee);
+                    assert_eq!(round_trip.reported_tcb.snp, tcb.snp);
+                    assert_eq!(round_trip.reported_tcb.microcode, tcb.microcode);
+                    assert_eq!(round_trip.reported_tcb.fmc, None); // FMC lost in legacy format
+                }
+            }
+            let round_trip_mask_id = round_trip.mask_id;
+            assert_eq!(round_trip_mask_id, mask_id);
+        }
     }
 
     #[test]
     fn test_version_comparisons() {
-        let v1 = TcbVersion::new(1, 2, 3, 4);
-        let v2 = TcbVersion::new(1, 2, 3, 5);
-        let v3 = TcbVersion::new(1, 2, 3, 4);
+        let v1 = TcbVersion::new(None, 1, 2, 3, 4);
+        let v2 = TcbVersion::new(None, 1, 2, 3, 5);
+        let v3 = TcbVersion::new(None, 1, 2, 3, 4);
 
         assert!(v1 < v2);
         assert_eq!(v1, v3);
@@ -859,26 +1245,11 @@ mod tests {
     }
 
     #[test]
-    fn test_build_version_comparisons() {
-        let b1 = Build {
-            version: Version { major: 1, minor: 0 },
-            build: 100,
-        };
-        let b2 = Build {
-            version: Version { major: 1, minor: 1 },
-            build: 50,
-        };
-
-        assert!(b1 < b2);
-        assert_ne!(b1, b2);
-    }
-
-    #[test]
     fn test_platform_status_boundary() {
         let status = SnpPlatformStatus {
             guest_count: u32::MAX,
             build_id: u32::MAX,
-            mask_chip_id: u32::MAX,
+            platform_policy: PlatformPolicy(u32::MAX),
             ..Default::default()
         };
 
@@ -889,29 +1260,12 @@ mod tests {
     #[test]
     fn test_mask_id_boundary() {
         let mut mask = MaskId(u32::MAX);
-        assert_eq!(mask.mask_chip_id(), 1);
-        assert_eq!(mask.mask_chip_key(), 1);
+        assert!(mask.mask_chip_id());
+        assert!(mask.mask_chip_key());
 
         mask = MaskId(0);
-        assert_eq!(mask.mask_chip_id(), 0);
-        assert_eq!(mask.mask_chip_key(), 0);
-    }
-
-    #[test]
-    fn test_platform_init_combinations() {
-        let mut init = PlatformInit::empty();
-        init.insert(PlatformInit::IS_RMP_INIT | PlatformInit::IS_TIO_EN);
-        assert!(init.contains(PlatformInit::IS_RMP_INIT | PlatformInit::IS_TIO_EN));
-
-        init.remove(PlatformInit::IS_RMP_INIT);
-        assert!(!init.contains(PlatformInit::IS_RMP_INIT));
-        assert!(init.contains(PlatformInit::IS_TIO_EN));
-    }
-
-    #[test]
-    fn test_tcb_version_reserved() {
-        let tcb = TcbVersion::new(1, 2, 3, 4);
-        assert_eq!(tcb._reserved, [0u8; 4]);
+        assert!(!mask.mask_chip_id());
+        assert!(!mask.mask_chip_key());
     }
 
     #[test]
@@ -923,16 +1277,22 @@ mod tests {
     #[test]
     fn test_platform_status_all_fields() {
         let status: SnpPlatformStatus = SnpPlatformStatus {
-            version: Version { major: 1, minor: 2 },
+            version: (1, 2),
             build_id: 0xDEADBEEF,
-            mask_chip_id: 0x1,
+            platform_policy: PlatformPolicy(0x7f),
             state: 0xFF,
             ..Default::default()
         };
-        assert_eq!(status.version.major, 1);
-        assert_eq!(status.version.minor, 2);
+        assert_eq!(status.version.0, 1);
+        assert_eq!(status.version.1, 2);
         assert_eq!(status.build_id, 0xDEADBEEF);
-        assert_eq!(status.mask_chip_id, 0x1);
+        assert!(status.platform_policy.mask_chip_id());
+        assert!(status.platform_policy.mask_chip_key());
+        assert!(status.platform_policy.vlek_en());
+        assert!(status.platform_policy.feature_info());
+        assert!(status.platform_policy.rapl_dis());
+        assert!(status.platform_policy.ciphertext_hiding_dram_cap());
+        assert!(status.platform_policy.ciphertext_hiding_dram_en());
         assert_eq!(status.state, 0xFF);
     }
 
@@ -949,8 +1309,9 @@ mod tests {
         ];
 
         for cert_type in cert_types {
-            let serialized = bincode::serialize(&cert_type).unwrap();
-            let deserialized: CertType = bincode::deserialize(&serialized).unwrap();
+            let serialized = bincode::encode_to_vec(&cert_type, BINCODE_CFG).unwrap();
+            let (deserialized, _): (CertType, usize) =
+                bincode::decode_from_slice(&serialized, BINCODE_CFG).unwrap();
             assert_eq!(cert_type, deserialized);
         }
     }
@@ -1007,8 +1368,9 @@ mod tests {
     fn test_cert_table_entry_deserialization() {
         let entry = CertTableEntry::new(CertType::ARK, vec![1, 2, 3, 4]);
 
-        let serialized = bincode::serialize(&entry).unwrap();
-        let deserialized: CertTableEntry = bincode::deserialize(&serialized).unwrap();
+        let serialized = bincode::encode_to_vec(&entry, BINCODE_CFG).unwrap();
+        let (deserialized, _): (CertTableEntry, usize) =
+            bincode::decode_from_slice(&serialized, BINCODE_CFG).unwrap();
 
         assert_eq!(entry.cert_type, deserialized.cert_type);
         assert_eq!(entry.data, deserialized.data);
@@ -1033,24 +1395,12 @@ mod tests {
     }
 
     #[test]
-    fn test_build_deserialization() {
-        let build = Build {
-            version: Version { major: 1, minor: 2 },
-            build: 42,
-        };
-
-        let serialized = bincode::serialize(&build).unwrap();
-        let deserialized: Build = bincode::deserialize(&serialized).unwrap();
-
-        assert_eq!(build, deserialized);
-    }
-
-    #[test]
     fn test_tcb_version_deserialization() {
-        let tcb = TcbVersion::new(1, 2, 3, 4);
+        let tcb = TcbVersion::new(None, 1, 2, 3, 4);
 
-        let serialized = bincode::serialize(&tcb).unwrap();
-        let deserialized: TcbVersion = bincode::deserialize(&serialized).unwrap();
+        let serialized = bincode::encode_to_vec(tcb, BINCODE_CFG).unwrap();
+        let (deserialized, _): (TcbVersion, usize) =
+            bincode::decode_from_slice(&serialized, BINCODE_CFG).unwrap();
 
         assert_eq!(tcb, deserialized);
     }
@@ -1066,8 +1416,9 @@ mod tests {
         ];
 
         for mask in test_cases {
-            let serialized = bincode::serialize(&mask).unwrap();
-            let deserialized: MaskId = bincode::deserialize(&serialized).unwrap();
+            let serialized = bincode::encode_to_vec(mask, BINCODE_CFG).unwrap();
+            let (deserialized, _): (MaskId, usize) =
+                bincode::decode_from_slice(&serialized, BINCODE_CFG).unwrap();
 
             assert_eq!(mask.0, deserialized.0);
             assert_eq!(mask.mask_chip_id(), deserialized.mask_chip_id());
@@ -1199,14 +1550,14 @@ mod tests {
     }
     #[test]
     fn test_cert_table_entry_deserialize() {
-        use bincode::{deserialize, serialize};
-
         // Create a test entry
         let original = CertTableEntry::new(CertType::ARK, vec![0x41, 0x42, 0x43]);
 
         // Serialize and then deserialize
-        let serialized = serialize(&original).expect("Failed to serialize");
-        let deserialized: CertTableEntry = deserialize(&serialized).expect("Failed to deserialize");
+        let serialized =
+            bincode::encode_to_vec(&original, BINCODE_CFG).expect("Failed to serialize");
+        let (deserialized, _): (CertTableEntry, usize) =
+            bincode::decode_from_slice(&serialized, BINCODE_CFG).expect("Failed to deserialize");
 
         // Verify deserialized data matches original
         assert_eq!(deserialized.cert_type, original.cert_type);
@@ -1249,32 +1600,16 @@ mod tests {
     }
 
     #[test]
-    fn test_build_deserialize() {
-        use bincode::{deserialize, serialize};
-
-        let original = Build {
-            version: 1.into(),
-            build: 2,
-        };
-
-        let serialized = serialize(&original).expect("Failed to serialize");
-        let deserialized: Build = deserialize(&serialized).expect("Failed to deserialize");
-
-        assert_eq!(deserialized.version, original.version);
-        assert_eq!(deserialized.build, original.build);
-    }
-
-    #[test]
     fn test_chain_visitor_methods() {
-        use bincode::{deserialize, serialize};
         // Test sequence visiting
         let chain_data = vec![
             CertTableEntry::new(CertType::ARK, vec![1]),
             CertTableEntry::new(CertType::ASK, vec![2]),
         ];
-        let serialized = serialize(&chain_data).expect("Failed to serialize");
-        let deserialized: Vec<CertTableEntry> =
-            deserialize(&serialized).expect("Failed to deserialize");
+        let serialized =
+            bincode::encode_to_vec(&chain_data, BINCODE_CFG).expect("Failed to serialize");
+        let (deserialized, _): (Vec<CertTableEntry>, usize) =
+            bincode::decode_from_slice(&serialized, BINCODE_CFG).expect("Failed to deserialize");
 
         assert_eq!(deserialized.len(), chain_data.len());
         assert_eq!(deserialized[0].cert_type, chain_data[0].cert_type);
@@ -1282,20 +1617,258 @@ mod tests {
 
     #[test]
     fn test_field_visitor_methods() {
-        use bincode::{deserialize, serialize};
-
         // Test various field types
         let bytes = vec![1u8, 2u8, 3u8];
-        let serialized = serialize(&bytes).expect("Failed to serialize");
-        let deserialized: Vec<u8> = deserialize(&serialized).expect("Failed to deserialize");
+        let serialized = bincode::encode_to_vec(&bytes, BINCODE_CFG).expect("Failed to serialize");
+        let (deserialized, _): (Vec<u8>, usize) =
+            bincode::decode_from_slice(&serialized, BINCODE_CFG).expect("Failed to deserialize");
 
         assert_eq!(deserialized, bytes);
 
         // Test string field
         let text = "test";
-        let serialized = serialize(&text).expect("Failed to serialize");
-        let deserialized: String = deserialize(&serialized).expect("Failed to deserialize");
+        let serialized = bincode::encode_to_vec(text, BINCODE_CFG).expect("Failed to serialize");
+        let (deserialized, _): (String, usize) =
+            bincode::decode_from_slice(&serialized, BINCODE_CFG).expect("Failed to deserialize");
 
         assert_eq!(deserialized, text);
+    }
+
+    #[test]
+    fn test_snp_platform_status_flags_bitor_assign() {
+        let mut flags1 = SnpPlatformStatusFlags::default();
+        let flags2 = SnpPlatformStatusFlags::default();
+        flags1 |= flags2;
+        assert_eq!(flags1.0, 0);
+
+        let mut flags1 = SnpPlatformStatusFlags(1);
+        let flags2 = SnpPlatformStatusFlags(2);
+        flags1 |= flags2;
+        assert_eq!(flags1.0, 3);
+    }
+
+    #[test]
+    fn test_platform_init_bitor_assign() {
+        let mut init1: PlatformInit = Default::default();
+        let init2: PlatformInit = Default::default();
+        init1 |= init2;
+        assert_eq!(init1.0, 0);
+
+        let mut init1 = PlatformInit(1);
+        let init2 = PlatformInit(2);
+        init1 |= init2;
+        assert_eq!(init1.0, 3);
+    }
+
+    #[test]
+    fn test_tcb_version_default() {
+        let tcb_version: TcbVersion = Default::default();
+        assert_eq!(tcb_version.bootloader, 0);
+        assert_eq!(tcb_version.tee, 0);
+        assert_eq!(tcb_version.snp, 0);
+        assert_eq!(tcb_version.microcode, 0);
+    }
+
+    #[test]
+    fn test_mask_id_from_bytes() {
+        let bytes: [u8; 4] = [0b11, 0b11, 0b11, 0b11];
+        let mask_id = MaskId::from_bytes(bytes);
+        assert!(mask_id.mask_chip_id());
+        assert!(mask_id.mask_chip_key());
+    }
+
+    #[test]
+    fn test_mask_id_to_bytes() {
+        let mask_id = MaskId(0x01020304);
+        let bytes = mask_id.to_bytes();
+        assert_eq!(bytes, [0x04, 0x03, 0x02, 0x01]);
+    }
+
+    #[test]
+    fn test_mask_id_default() {
+        let mask_id: MaskId = Default::default();
+        assert_eq!(mask_id.0, 0);
+    }
+
+    #[test]
+    fn test_snp_platform_status_non_turin() {
+        let expected: SnpPlatformStatus = SnpPlatformStatus {
+            version: (1, 1),
+            state: 1,
+            is_rmp_init: PlatformInit(1),
+            build_id: 1,
+            platform_policy: PlatformPolicy(1),
+            guest_count: 0,
+            platform_tcb_version: TcbVersion {
+                fmc: None,
+                bootloader: 1,
+                tee: 1,
+                snp: 1,
+                microcode: 1,
+            },
+            reported_tcb_version: TcbVersion {
+                fmc: None,
+                bootloader: 1,
+                tee: 1,
+                snp: 1,
+                microcode: 1,
+            },
+        };
+        let raw_actual: FFI::types::SnpPlatformStatus = FFI::types::SnpPlatformStatus {
+            buffer: [
+                1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, // Other stuff
+                1, 1, 0, 0, 0, 0, 1, 1, //Platform TCB
+                1, 1, 0, 0, 0, 0, 1, 1, //Reported TCB
+            ],
+        };
+        let actual: SnpPlatformStatus = (Generation::Milan, &*raw_actual).try_into().unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_snp_platform_status_turin() {
+        let expected: SnpPlatformStatus = SnpPlatformStatus {
+            version: (1, 1),
+            state: 1,
+            is_rmp_init: PlatformInit(1),
+            build_id: 1,
+            platform_policy: PlatformPolicy(1),
+            guest_count: 0,
+            platform_tcb_version: TcbVersion {
+                fmc: Some(1),
+                bootloader: 1,
+                tee: 1,
+                snp: 1,
+                microcode: 1,
+            },
+            reported_tcb_version: TcbVersion {
+                fmc: Some(1),
+                bootloader: 1,
+                tee: 1,
+                snp: 1,
+                microcode: 1,
+            },
+        };
+        let raw_actual: FFI::types::SnpPlatformStatus = FFI::types::SnpPlatformStatus {
+            buffer: [
+                1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, // Other stuff
+                1, 1, 1, 1, 0, 0, 0, 1, //Platform TCB
+                1, 1, 1, 1, 0, 0, 0, 1, //Reported TCB
+            ],
+        };
+        let actual: SnpPlatformStatus = (Generation::Turin, &*raw_actual).try_into().unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_wrapped_vlek_hashstick_from_bytes() {
+        // Create a test buffer with the correct layout
+        let mut test_buffer = Vec::with_capacity(432);
+
+        // IV (12 bytes)
+        test_buffer.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+
+        // Reserved field 1 (4 bytes of zeros)
+        test_buffer.extend_from_slice(&[0, 0, 0, 0]);
+
+        // VLEK_WRAPPED (384 bytes)
+        test_buffer.extend_from_slice(&[42; 384]);
+
+        // TCB_VERSION (8 bytes)
+        test_buffer.extend_from_slice(&[1, 2, 0, 0, 0, 0, 3, 4]); // bootloader=1, tee=2, snp=3, microcode=4
+
+        // Reserved field 2 (8 bytes of zeros)
+        test_buffer.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+
+        // VLEK_AUTH_TAG (16 bytes)
+        test_buffer.extend_from_slice(&[9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0]);
+
+        // Parse the buffer
+        let hashstick = WrappedVlekHashstick::from_bytes(&test_buffer, Generation::Milan).unwrap();
+
+        // Verify the fields
+        assert_eq!(hashstick.iv, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(hashstick.vlek_wrapped.as_ref(), &[42; 384]);
+        assert_eq!(hashstick.tcb_version.bootloader, 1);
+        assert_eq!(hashstick.tcb_version.tee, 2);
+        assert_eq!(hashstick.tcb_version.snp, 3);
+        assert_eq!(hashstick.tcb_version.microcode, 4);
+        assert_eq!(
+            hashstick.vlek_auth_tag,
+            [9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn test_wrapped_vlek_hashstick_invalid_length() {
+        // Test with a buffer that's too short
+        let test_buffer = [0u8; 431]; // One byte too short
+        let result = WrappedVlekHashstick::from_bytes(&test_buffer, Generation::Milan);
+        assert!(result.is_err());
+
+        // Test with a buffer that's too long
+        let test_buffer = [0u8; 433]; // One byte too long
+        let result = WrappedVlekHashstick::from_bytes(&test_buffer, Generation::Milan);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wrapped_vlek_hashstick_write_bytes() {
+        // Create a test hashstick
+        let hashstick = WrappedVlekHashstick {
+            iv: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            vlek_wrapped: Array([42; 384]),
+            tcb_version: TcbVersion::new(None, 1, 2, 3, 4),
+            vlek_auth_tag: [9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0],
+        };
+
+        // Write it to a buffer
+        let mut buffer = Vec::with_capacity(432);
+
+        hashstick
+            .write_bytes(&mut buffer, Generation::Milan)
+            .unwrap();
+
+        // Verify the buffer is the correct length
+        assert_eq!(buffer.len(), 432);
+
+        // Verify the fields were written correctly
+        assert_eq!(&buffer[0..12], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]); // IV
+        assert_eq!(&buffer[0x0C..0x10], &[0, 0, 0, 0]); // Reserved field 1
+        assert_eq!(&buffer[0x10..0x190], &[42; 384]); // VLEK_WRAPPED
+
+        // TCB_VERSION format depends on the CPU generation, so we'll read it back
+        let tcb_bytes = &buffer[0x190..0x198];
+
+        let tcb = TcbVersion::from_legacy_bytes(&tcb_bytes.try_into().unwrap());
+        assert_eq!(tcb.bootloader, 1);
+        assert_eq!(tcb.tee, 2);
+        assert_eq!(tcb.snp, 3);
+        assert_eq!(tcb.microcode, 4);
+
+        assert_eq!(&buffer[0x198..0x1A0], &[0, 0, 0, 0, 0, 0, 0, 0]); // Reserved field 2
+        assert_eq!(
+            &buffer[0x1A0..0x1B0],
+            &[9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0]
+        ); // VLEK_AUTH_TAG
+    }
+
+    #[test]
+    fn test_wrapped_vlek_hashstick_display() {
+        // Create a test hashstick
+        let hashstick = WrappedVlekHashstick {
+            iv: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            vlek_wrapped: Array([42; 384]),
+            tcb_version: TcbVersion::new(None, 1, 2, 3, 4),
+            vlek_auth_tag: [9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0],
+        };
+
+        // Convert to string and check contents
+        let display_string = format!("{}", hashstick);
+        assert!(display_string.contains("Wrapped VLEK Hashstick:"));
+        assert!(display_string.contains("IV:"));
+        assert!(display_string.contains("VLEK hashstic Wrapped:"));
+        assert!(display_string.contains("TCB:"));
+        assert!(display_string.contains("VLEK authentication tag:"));
     }
 }

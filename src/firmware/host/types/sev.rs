@@ -4,7 +4,7 @@
 
 pub use crate::firmware::linux::host::types::PlatformStatusFlags;
 
-use crate::{firmware::host::State, Build};
+use crate::firmware::host::State;
 
 #[cfg(feature = "openssl")]
 use std::convert::TryInto;
@@ -16,18 +16,82 @@ use crate::certs::sev::{
 };
 
 #[cfg(feature = "openssl")]
-use openssl::{ec::EcKey, ecdsa::EcdsaSig, pkey::Public};
+use openssl::{ec::EcKey, ecdsa::EcdsaSig, pkey::Public, sha::Sha256};
 
-use crate::certs::sev::sev::EcdsaSignature;
+use crate::util::{TypeLoad, TypeSave};
+
+use crate::util::array::Array;
 use serde::{Deserialize, Serialize};
 
-use std::fmt::Debug;
+use std::{
+    fmt::Debug,
+    io::{Read, Write},
+};
 
 const MNONCE_SIZE: usize = 128 / 8;
 const DIGEST_SIZE: usize = 256 / 8;
 const POLICY_SIZE: usize = 32 / 8;
 const POLICY_OFFSET: usize = MNONCE_SIZE + DIGEST_SIZE;
 const MEASURABLE_BYTES: usize = MNONCE_SIZE + DIGEST_SIZE + POLICY_SIZE;
+
+/// Information about the SEV platform version.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Version {
+    /// The major version number.
+    pub major: u8,
+
+    /// The minor version number.
+    pub minor: u8,
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}.{}", self.major, self.minor)
+    }
+}
+
+impl From<u16> for Version {
+    fn from(v: u16) -> Self {
+        Self {
+            major: ((v & 0xF0) >> 4) as u8,
+            minor: (v & 0x0F) as u8,
+        }
+    }
+}
+
+/// A description of the SEV platform's build information.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Build {
+    /// The version information.
+    pub version: Version,
+
+    /// The build number.
+    pub build: u8,
+}
+
+impl std::fmt::Display for Build {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}.{}", self.version, self.build)
+    }
+}
+
+impl codicon::Decoder<()> for Build {
+    type Error = std::io::Error;
+
+    fn decode(mut reader: impl Read, _: ()) -> std::io::Result<Self> {
+        reader.load()
+    }
+}
+
+impl codicon::Encoder<()> for Build {
+    type Error = std::io::Error;
+
+    fn encode(&self, mut writer: impl Write, _: ()) -> std::io::Result<()> {
+        writer.save(self)
+    }
+}
 
 /// Information regarding the SEV platform's current status.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,7 +119,7 @@ pub struct LegacyAttestationReport {
     /// 128-bit Nonce from the Command Buffer.
     pub mnonce: [u8; MNONCE_SIZE], // 0x00
     /// SHA-256 digest of launched guest.
-    pub launch_digest: [u8; POLICY_SIZE], // 0x10
+    pub launch_digest: [u8; DIGEST_SIZE], // 0x10
     /// Policy guest was launched with.
     pub policy: u32, // 0x30
     /// Key usage of SIG1 signing key.
@@ -65,9 +129,7 @@ pub struct LegacyAttestationReport {
     /// Reserved
     _reserved_0: u32, // 0x3C
     /// Signature of the report.
-    // #[serde(with = "BigArray")]
-    // pub signature: [u8; 144], // 0x40 - 0xCF
-    pub signature: EcdsaSignature,
+    pub signature: Array<u8, 144>, // 0x40 - 0xCF
 }
 
 impl LegacyAttestationReport {
@@ -91,8 +153,17 @@ impl Verifiable for (&Certificate, &LegacyAttestationReport) {
 
         let sig: EcdsaSig = (&self.1.signature).try_into()?;
 
-        sig.verify(&self.1.measurable_bytes(), pub_key)?;
+        let mut hasher = Sha256::new();
+        hasher.update(&self.1.measurable_bytes());
+        let base_digest = hasher.finish();
 
-        Ok(())
+        let signed = sig.verify(&base_digest, pub_key)?;
+        match signed {
+            true => Ok(()),
+            false => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "PEK does not sign the attestation report",
+            )),
+        }
     }
 }
