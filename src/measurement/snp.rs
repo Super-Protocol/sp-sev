@@ -3,7 +3,6 @@
 //! Operations to calculate guest measurement for different SEV modes
 use crate::{
     error::*,
-    launch::snp::PageType,
     measurement::{
         gctx::{Gctx, Updating, VMSA_GPA},
         ovmf::{OvmfSevMetadataSectionDesc, SectionType, OVMF},
@@ -11,6 +10,7 @@ use crate::{
         vcpu_types::CpuType,
         vmsa::{GuestFeatures, VMMType, VMSA},
     },
+    page_type::PageType,
     parser::{ByteParser, Decoder, Encoder},
     util::parser_helper::{ReadExt, WriteExt},
 };
@@ -327,6 +327,85 @@ pub fn snp_calc_launch_digest_with_hashes(
         snp_measurement.kernel_hash, 
         snp_measurement.initrd_hash,
         snp_measurement.append_hash
+    );
+
+    let official_vmm_type = match snp_measurement.vmm_type {
+        Some(vmm) => vmm,
+        None => VMMType::QEMU,
+    };
+
+    snp_update_metadata_pages(&mut gctx, &ovmf, Some(&sev_hashes), official_vmm_type)?;
+
+    let vmsa = VMSA::new(
+        ovmf.sev_es_reset_eip()?.into(),
+        snp_measurement.vcpu_type,
+        official_vmm_type,
+        Some(snp_measurement.vcpus as u64),
+        snp_measurement.guest_features,
+    );
+
+    for vmsa_page in vmsa.pages(snp_measurement.vcpus as usize)?.iter() {
+        gctx.update_page(PageType::Vmsa, VMSA_GPA, Some(vmsa_page.as_slice()), None)?
+    }
+
+    let gctx = gctx.finished();
+
+    Ok(gctx.ld())
+}
+
+/// Arguments required to calculate the SNP measurement from in-memory OVMF bytes
+/// and pre-computed kernel/initrd/cmdline hashes. Unlike
+/// [`SnpMeasurementWithHashesArgs`] this carries the OVMF firmware as bytes
+/// rather than a filesystem path, so the measurement can be computed on targets
+/// without a filesystem (e.g. the browser / `wasm32`).
+pub struct SnpMeasurementWithHashesFromBytesArgs<'a> {
+    /// Number of vcpus
+    pub vcpus: u32,
+    /// vcpu type
+    pub vcpu_type: CpuType,
+    /// OVMF firmware bytes
+    pub ovmf_data: Vec<u8>,
+    /// Active kernel guest features
+    pub guest_features: GuestFeatures,
+    /// Kernel hash
+    pub kernel_hash: Sha256Hash,
+    /// Initrd hash
+    pub initrd_hash: Sha256Hash,
+    /// Append arguments hash for kernel
+    pub append_hash: Sha256Hash,
+    /// Already calculated OVMF hash
+    pub ovmf_hash_str: Option<&'a str>,
+    /// vmm type
+    pub vmm_type: Option<VMMType>,
+}
+
+/// Calulate an SEV-SNP launch digest from in-memory OVMF bytes and pre-computed
+/// kernel/initrd/cmdline hashes. Unlike [`snp_calc_launch_digest_with_hashes`]
+/// this performs no file I/O, so it is usable on targets without a filesystem
+/// (e.g. the browser / `wasm32`).
+pub fn snp_calc_launch_digest_with_hashes_from_bytes(
+    snp_measurement: SnpMeasurementWithHashesFromBytesArgs,
+) -> Result<SnpLaunchDigest, MeasurementError> {
+    let ovmf = OVMF::from_bytes(snp_measurement.ovmf_data)?;
+
+    let mut gctx: Gctx<Updating> = match snp_measurement.ovmf_hash_str {
+        Some(hash) => {
+            let ovmf_hash = Vec::from_hex(hash)?;
+            Gctx::new(ovmf_hash.as_slice())?
+        }
+        None => {
+            let mut gctx = Gctx::default();
+
+            gctx.update_page(PageType::Normal, ovmf.gpa(), Some(ovmf.data()), None)?;
+
+            gctx
+        }
+    };
+
+    let sev_hashes = SevHashes::new_raw(
+        snp_measurement.kernel_hash,
+        snp_measurement.initrd_hash,
+        snp_measurement.append_hash,
     );
 
     let official_vmm_type = match snp_measurement.vmm_type {

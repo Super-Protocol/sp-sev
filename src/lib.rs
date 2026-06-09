@@ -96,10 +96,12 @@ pub mod certs;
 pub mod firmware;
 #[cfg(target_os = "linux")]
 pub mod launch;
+
+/// SNP launch update page-type encoding (shared by the launch and measurement paths).
+pub mod page_type;
 #[cfg(all(
     any(feature = "sev", feature = "snp"),
-    feature = "openssl",
-    target_os = "linux"
+    any(feature = "openssl", feature = "crypto_nossl")
 ))]
 pub mod measurement;
 #[cfg(all(target_os = "linux", feature = "openssl", feature = "sev"))]

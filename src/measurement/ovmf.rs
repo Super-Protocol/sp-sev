@@ -257,7 +257,8 @@ pub struct OVMF {
 }
 
 impl OVMF {
-    /// Generate new OVMF structure by parsing the footer table and SEV metadata
+    /// Generate new OVMF structure by reading the firmware file and parsing the
+    /// footer table and SEV metadata.
     pub fn new(ovmf_file: PathBuf) -> Result<Self, MeasurementError> {
         let mut data = Vec::new();
         let mut file = match File::open(ovmf_file) {
@@ -267,6 +268,13 @@ impl OVMF {
 
         file.read_to_end(&mut data)?;
 
+        Self::from_bytes(data)
+    }
+
+    /// Generate new OVMF structure from in-memory firmware bytes by parsing the
+    /// footer table and SEV metadata. Unlike [`OVMF::new`] this performs no file
+    /// I/O, so it is available on targets without a filesystem (e.g. `wasm32`).
+    pub fn from_bytes(data: Vec<u8>) -> Result<Self, MeasurementError> {
         let mut ovmf = OVMF {
             data,
             table: HashMap::new(),

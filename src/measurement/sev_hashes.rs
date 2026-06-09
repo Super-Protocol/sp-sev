@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Operations to handle OVMF SEV-HASHES
-use openssl::sha::sha256;
+use crate::measurement::crypto::sha256;
 use std::fs::File;
 use std::io::Write;
 use std::{

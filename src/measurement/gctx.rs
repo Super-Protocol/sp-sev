@@ -2,14 +2,13 @@
 //! Operations to handle and create a Guest Context
 use std::convert::TryInto;
 
-use openssl::sha::sha384;
+use crate::measurement::crypto::sha384;
 
 use crate::error::*;
 
-#[cfg(target_os = "linux")]
 use crate::{
-    launch::snp::PageType,
     measurement::snp::{SnpLaunchDigest, LD_BYTES},
+    page_type::PageType,
 };
 
 // VMSA page is recorded in the RMP table with GPA (u64)(-1).
@@ -93,7 +92,6 @@ impl Gctx<Updating> {
 
     /// Update Lanunch digest type according to page type and guest physical address.
     /// Some Page types don't require data. Some page types just require size of the page.
-    #[cfg(target_os = "linux")]
     pub fn update_page(
         &mut self,
         page_type: PageType,
